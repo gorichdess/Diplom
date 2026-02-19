@@ -5,10 +5,12 @@ env = RobotEnv()
 
 obs, _ = env.reset()
 
-while True:
+for i in range(1000):
+    action = np.array([0.5, 0.5])
+    obs, r, term, trunc, _ = env.step(action)
 
-    left = float(input("left speed: "))
-    right = float(input("right speed: "))
+env.reset()
 
-    for _ in range(200):
-        env.step([left, right])
+for i in range(1000):
+    action = np.array([0.5, 0.5])
+    obs, r, term, trunc, _ = env.step(action)
