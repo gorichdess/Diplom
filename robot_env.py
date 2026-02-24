@@ -6,6 +6,22 @@ import pybullet_data
 import time
 import random
 from enum import IntEnum
+import os
+import sys
+
+class SuppressAllOutput:
+    def __enter__(self):
+        self.null_fd = os.open(os.devnull, os.O_RDWR)
+        self.save_fds = [os.dup(1), os.dup(2)]
+        os.dup2(self.null_fd, 1)
+        os.dup2(self.null_fd, 2)
+
+    def __exit__(self, *_):
+        os.dup2(self.save_fds[0], 1)
+        os.dup2(self.save_fds[1], 2)
+        os.close(self.null_fd)
+        os.close(self.save_fds[0])
+        os.close(self.save_fds[1])
 
 class TerrainType(IntEnum):
     EMPTY = 0
@@ -30,7 +46,7 @@ class RobotEnv(gym.Env):
         self.robot_id = None
 
         self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(55,), dtype=np.float32)
 
         # Connect to PyBullet
         if self.render:
@@ -38,23 +54,24 @@ class RobotEnv(gym.Env):
         else:
             self.physics_client = p.connect(p.DIRECT)
 
+        self.left_wheels = [2, 4]
+        self.right_wheels = [3, 5]
+
+
         #Reset the environment to initialize everything
         self.reset()
 
     def reset(self, seed=None, options=None):
-        #Full reset of the environment
         p.resetSimulation()
         p.setGravity(0, 0, -9.81)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         
         if self.render:
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)
 
-        #Generate terrain
         self.generate_random_grid()
         smooth_height = self.generate_terrain_from_grid()
-        self.heightfieldData = smooth_height.T.flatten().astype(np.float32)
+        self.heightfieldData = smooth_height.flatten().astype(np.float32)
 
         terrainShape = p.createCollisionShape(
             shapeType=p.GEOM_HEIGHTFIELD,
@@ -64,33 +81,23 @@ class RobotEnv(gym.Env):
             numHeightfieldColumns=self.size
         )
         
-        total_length = self.size * self.scale
-        # Center the terrain at (0,0) in world coordinates
-        offset = total_length / 2.0 - (self.scale / 2.0)
+        self.terrain = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=terrainShape)
+        p.changeVisualShape(self.terrain, -1, rgbaColor=[0.5, 0.5, 0.5, 1])
 
-        self.terrain = p.createMultiBody(
-            baseMass=0,
-            baseCollisionShapeIndex=terrainShape,
-            basePosition=[offset, offset, 0]
-        )
-        p.changeVisualShape(self.terrain, -1, rgbaColor=[0.5, 0.5, 0.5, 1], specularColor=[1, 1, 1])
+        total_len = self.size * self.scale
+        half_len = total_len / 2.0 
 
-        # Robot spawn
-        start_x = self.start[0] * self.scale + offset # offset нужен, чтобы центр карты был в (0,0) мира
-        start_y = self.start[1] * self.scale + offset
-        # Height
-        start_h = self.heightfieldData[self.start[0] * self.size + self.start[1]]
-        
-        self.robot_id = p.loadURDF("husky/husky.urdf", [start_x, start_y, start_h + 0.5])
+        def grid_to_world(i, j):
+            # (i + 0.5) чтобы попасть в центр ячейки
+            x = (i + 0.5) * self.scale - half_len
+            y = (j + 0.5) * self.scale - half_len
+            return x, y
 
-        pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+        start_x, start_y = grid_to_world(self.start[0], self.start[1])
+        start_h = smooth_height[self.start[0], self.start[1]]
         
-        self.left_wheels = [2, 4]
-        self.right_wheels = [3, 5]
-        
-        #Goal position in world coordinates
-        self.goal_pos = (self.goal[0] * self.scale, self.goal[1] * self.scale)
-        self.prev_dist = np.linalg.norm(np.array(pos[:2]) - self.goal_pos)
+        with SuppressAllOutput():
+            self.robot_id = p.loadURDF("husky/husky.urdf", [start_x, start_y, start_h + 0.5])
 
         # Camera setup
         if self.render:
@@ -100,6 +107,20 @@ class RobotEnv(gym.Env):
                 cameraPitch=-30, 
                 cameraTargetPosition=[start_x, start_y, start_h]
             )
+
+        goal_x, goal_y = grid_to_world(self.goal[0], self.goal[1])
+        goal_z = smooth_height[self.goal[0], self.goal[1]] + 0.5
+        self.goal_pos = np.array([goal_x, goal_y])
+
+        visual_shape = p.createVisualShape(p.GEOM_SPHERE, radius=0.4, rgbaColor=[1, 0, 0, 1])
+        self.goal_marker = p.createMultiBody(baseMass=0, baseVisualShapeIndex=visual_shape, 
+                                            basePosition=[goal_x, goal_y, goal_z])
+
+        self.prev_dist = np.linalg.norm(np.array([start_x, start_y]) - self.goal_pos)
+        self.step_count = 0
+        
+        if self.render:
+            p.resetDebugVisualizerCamera(10, 45, -30, [0, 0, 0])
 
         return self._get_observation(), {}
 
@@ -117,10 +138,9 @@ class RobotEnv(gym.Env):
                 elif r < 0.2:
                     self.grid[i,j] = TerrainType.SWAMP.value
 
-        if self.start is None:
-            self.start = (0,0)
-        if self.goal is None:
-            self.goal = (self.size-1, self.size-1)
+        margin = 2
+        self.start = (margin, margin)
+        self.goal = (self.size - margin - 1, self.size - margin - 1)
 
         self.grid[self.start[0], self.start[1]] = TerrainType.START.value
         self.grid[self.goal[0], self.goal[1]] = TerrainType.GOAL.value
@@ -132,11 +152,11 @@ class RobotEnv(gym.Env):
             for j in range(self.size):
                 cell = self.grid[i,j]
                 if cell == TerrainType.MOUNTAIN.value:
-                    base_height[i,j] = 1.5
+                    base_height[i,j] = 1.7
                 elif cell == TerrainType.ROUGH.value:
                     base_height[i,j] = 0.5
                 elif cell == TerrainType.SWAMP.value:
-                    base_height[i,j] = -0.5
+                    base_height[i,j] = -0.6
                 else:
                     base_height[i,j] = 0.0
 
@@ -160,89 +180,158 @@ class RobotEnv(gym.Env):
     def step(self, action):
         self.apply_action(action)
 
-        for _ in range(10):
+        for _ in range(20):
             p.stepSimulation()
 
         obs = self._get_observation()
         reward, done = self.compute_reward()
 
+        pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+        lin_vel, _ = p.getBaseVelocity(self.robot_id)
+        
         terminated = done
         truncated = False
+
+        current_speed = np.linalg.norm(lin_vel[:2])
+        
+        if current_speed < 0.01:
+            self.stuck_steps = getattr(self, 'stuck_steps', 0) + 1
+        else:
+            self.stuck_steps = 0
+
+        if self.stuck_steps > 100:
+            # print("Robot is stuck!")
+            terminated = True
+            reward -= 50  
+
+        _, orn = p.getBasePositionAndOrientation(self.robot_id)
+        roll, pitch, _ = p.getEulerFromQuaternion(orn)
+        if abs(roll) > 1.4 or abs(pitch) > 1.4:
+            # print("Robot flipped!")
+            terminated = True
+            reward -= 150 
+
+        if pos[2] < -2: 
+            terminated = True
+            reward -= 200
+
+        boundary = (self.size * self.scale) / 2.0
+        if abs(pos[0]) > boundary + 0.5 or abs(pos[1]) > boundary + 0.5:
+            terminated = True
+            reward -= 100
+
+        self.step_count += 1
+        if self.step_count >= 2000:
+            truncated = True
+
         return obs, reward, terminated, truncated, {}
 
     
     def apply_action(self, action):
-
-        left = action[0]
-        right = action[1]
+        max_velocity = 5.0 
+        left = action[0] * max_velocity
+        right = action[1] * max_velocity
 
         for wheel in self.left_wheels:
             p.setJointMotorControl2(self.robot_id, wheel,
                                     p.VELOCITY_CONTROL,
                                     targetVelocity=left,
-                                    force=20)
+                                    force=100) 
 
         for wheel in self.right_wheels:
             p.setJointMotorControl2(self.robot_id, wheel,
                                     p.VELOCITY_CONTROL,
                                     targetVelocity=right,
-                                    force=20)
+                                    force=100)
             
     def compute_reward(self):
+        pos, orn = p.getBasePositionAndOrientation(self.robot_id)
+        lin_vel, _ = p.getBaseVelocity(self.robot_id)
+        
+        current_dist = np.linalg.norm(np.array(pos[:2]) - self.goal_pos)
+        progress = self.prev_dist - current_dist
+        self.prev_dist = current_dist
 
-        pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+        reward = progress * 100.0 
 
-        dist = np.linalg.norm(np.array(pos[:2]) - self.goal_pos)
+        goal_vec = self.goal_pos - np.array(pos[:2])
+        goal_vec = goal_vec / (np.linalg.norm(goal_vec) + 1e-6)
+        velocity_towards_goal = np.dot(np.array(lin_vel[:2]), goal_vec)
+        
+        reward += velocity_towards_goal * 2.0
 
-        reward = (self.prev_dist - dist) * 1000   # приблизился → плюс
+        speed = np.linalg.norm(lin_vel[:2])
+        if speed < 0.05:
+            reward -= 0.1 
 
-        self.prev_dist = dist
+        roll, pitch, _ = p.getEulerFromQuaternion(orn)
+        if abs(roll) > 0.6 or abs(pitch) > 0.6:
+            reward -= 1.0 
+        
+        done = False
+        if abs(roll) > 1.4 or abs(pitch) > 1.4:
+            reward -= 50.0
 
-        if dist < 0.5:
-            reward += 100
+        if current_dist < 0.8:
+            reward += 1000.0
             done = True
-        else:
-            done = False
 
         return reward, done
 
 
     def _get_observation(self):
         pos, orn = p.getBasePositionAndOrientation(self.robot_id)
-
         x, y = pos[0], pos[1]
-
-        goal_vec = np.array(self.goal_pos) - np.array([x, y])
+        
+        _, _, yaw = p.getEulerFromQuaternion(orn)
+        
+        goal_vec = self.goal_pos - np.array([x, y])
         dist = np.linalg.norm(goal_vec)
+        
+        abs_target_angle = np.arctan2(goal_vec[1], goal_vec[0])
+        
+        rel_target_angle = abs_target_angle - yaw
+        
+        target_sin = np.sin(rel_target_angle)
+        target_cos = np.cos(rel_target_angle)
 
         local_patch = self.get_local_heightmap(x, y)
 
         obs = np.concatenate([
-            [x, y, dist],
-            local_patch.flatten()
-        ])
+            [x / 10.0, y / 10.0, dist / 10.0], 
+            [target_sin, target_cos],          
+            [yaw / np.pi],                     
+            local_patch.flatten()              
+        ]).astype(np.float32)
 
         return obs
     
-    def get_local_heightmap(self, x, y, patch_size=3):
-    
-        cell_size = 0.65
+    def get_local_heightmap(self, x, y, patch_size=7):
 
-        cx = int(x / cell_size)
-        cy = int(y / cell_size)
+        total_len = self.size * self.scale
+        half_len = total_len / 2.0
+        
+        cx = int((x + half_len) / self.scale)
+        cy = int((y + half_len) / self.scale)
 
         half = patch_size // 2
 
         patch = np.zeros((patch_size, patch_size))
 
+        pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+        robot_z = pos[2]
+
+        patch = np.zeros((patch_size, patch_size))
+
         for i in range(-half, half+1):
             for j in range(-half, half+1):
-
                 gx = cx + i
                 gy = cy + j
-
                 if 0 <= gx < self.size and 0 <= gy < self.size:
                     idx = gx * self.size + gy
-                    patch[i+half, j+half] = self.heightfieldData[idx]
+                    patch[i+half, j+half] = self.heightfieldData[idx] - robot_z
+                else:
+                    patch[i+half, j+half] = -2.0 
+
 
         return patch
