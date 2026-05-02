@@ -7,8 +7,7 @@ from model import ActorCritic
 def test():
 
     env = RobotEnv(render=True)
-
-    model = ActorCritic(14, 2)
+    model = ActorCritic(env.obs_dim, 2)   # was (14, 2)
     model.load_state_dict(torch.load("best_model.pth", map_location="cpu"))
     model.eval()
 

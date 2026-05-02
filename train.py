@@ -9,7 +9,6 @@ from rl_agent import PPOAgent
 
 
 def setup_logger():
-
     logging.basicConfig(
         filename="training.log",
         filemode="w",
@@ -19,11 +18,17 @@ def setup_logger():
 
 
 def train():
-
     setup_logger()
 
     env = RobotEnv(render=False)
-    agent = PPOAgent(14, 2)
+    agent = PPOAgent(env.obs_dim, 2)   # автоматически 22
+
+    # Загружаем лучшие веса, чтобы продолжить обучение
+    try:
+        agent.ac.load_state_dict(torch.load("best_model.pth"))
+        print("Loaded best_model.pth. Continuing training...")
+    except FileNotFoundError:
+        print("best_model.pth not found, starting from scratch.")
 
     best_reward = -1e9
     reward_window = []
@@ -33,21 +38,15 @@ def train():
     print("Training started...")
 
     for ep in tqdm(range(4000)):
-
         state, _ = env.reset()
-
         done = False
         ep_reward = 0
         ep_steps = 0
 
         while not done:
-
             action, value, logp = agent.ac.get_action(state)
-
             next_state, reward, term, trunc, _ = env.step(action)
-
             done_flag = term or trunc
-
             agent.store((
                 state,
                 action,
@@ -56,7 +55,6 @@ def train():
                 done_flag,
                 value
             ))
-
             state = next_state
             ep_reward += reward
             ep_steps += 1
@@ -70,20 +68,15 @@ def train():
 
         avg100 = np.mean(reward_window)
 
-        # Save best model
         if ep_reward > best_reward:
             best_reward = ep_reward
             torch.save(agent.ac.state_dict(), "best_model.pth")
 
-        # Save checkpoints
         if ep % 250 == 0:
             torch.save(agent.ac.state_dict(), f"checkpoint_{ep}.pth")
 
         elapsed = time.time() - start_time
 
-        # ------------------------------------
-        # FULL LOG ENTRY EVERY EPISODE
-        # ------------------------------------
         log_line = (
             f"EP {ep:04d} | "
             f"Reward {ep_reward:8.2f} | "
@@ -96,7 +89,6 @@ def train():
 
         logging.info(log_line)
 
-        # Console every 20 episodes
         if ep % 20 == 0:
             print(log_line)
 
