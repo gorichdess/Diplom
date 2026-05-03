@@ -20,10 +20,11 @@ def setup_logger():
 def train():
     setup_logger()
 
-    env = RobotEnv(render=False)
-    agent = PPOAgent(env.obs_dim, 2)   # автоматически 22
+    # Start with a very easy terrain (difficulty=0.2) and gradually increase
+    env = RobotEnv(render=False, difficulty=0.2)
+    agent = PPOAgent(env.obs_dim, 2)
 
-    # Загружаем лучшие веса, чтобы продолжить обучение
+    # Try to load existing best model to continue training
     try:
         agent.ac.load_state_dict(torch.load("best_model.pth"))
         print("Loaded best_model.pth. Continuing training...")
@@ -34,10 +35,19 @@ def train():
     reward_window = []
 
     start_time = time.time()
-
     print("Training started...")
 
-    for ep in tqdm(range(4000)):
+    total_episodes = 4000
+
+    for ep in tqdm(range(total_episodes)):
+        # --- Curriculum: increase terrain difficulty linearly ---
+        difficulty = min(1.0, 0.2 + 0.8 * (ep / 1500))   # max difficulty after 1500 eps
+        env.difficulty = difficulty
+
+        # --- Decay entropy coefficient to gradually reduce exploration ---
+        ent_coef = 0.05 * (1.0 - ep / total_episodes) + 0.01  # floor at 0.01
+        agent.set_entropy_coef(ent_coef)
+
         state, _ = env.reset()
         done = False
         ep_reward = 0
@@ -84,6 +94,7 @@ def train():
             f"Best {best_reward:8.2f} | "
             f"Steps {ep_steps:4d} | "
             f"Loss {loss:8.4f} | "
+            f"Diff {difficulty:4.2f} | "
             f"Time {elapsed:8.1f}s"
         )
 
