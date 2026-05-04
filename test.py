@@ -7,7 +7,7 @@ from model import ActorCritic
 def test():
     env = RobotEnv(render=True)
     model = ActorCritic(env.obs_dim, 2)
-    model.load_state_dict(torch.load("checkpoint_250.pth", map_location="cpu"))
+    model.load_state_dict(torch.load("checkpoint_500.pth", map_location="cpu"))
     model.eval()
 
     state, _ = env.reset()
