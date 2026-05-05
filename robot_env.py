@@ -26,8 +26,20 @@ class RobotEnv(gym.Env):
         # Action: [throttle, steer] in [-1, 1]
         self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
 
+        self.sample_offsets = [
+            (1.5, 0.0),
+            (1.0, 0.5),
+            (1.0, -0.5),
+            (0.5, 1.0),
+            (0.5, -1.0),
+            (0.0, 1.5),
+            (0.0, -1.5),
+            (-0.5, 1.0),
+            (-0.5, -1.0),
+            (0.0, 0.0),
+        ]
         # Obs: 14 base + 8 terrain samples
-        self.obs_dim = 22
+        self.obs_dim = 14 + len(self.sample_offsets)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
         )
@@ -65,8 +77,8 @@ class RobotEnv(gym.Env):
 
         # Stuck logic
         self.stuck_counter = 0
-        self.stuck_threshold = 0.02
-        self.max_stuck_steps = 50
+        self.stuck_threshold = 0.005
+        self.max_stuck_steps = 500
 
         # Joint lists
         self.wheel_joints = []
@@ -125,7 +137,6 @@ class RobotEnv(gym.Env):
             x = -half_extent + ix * self.scale
             y = -half_extent + iy * self.scale
 
-            # ✅ FIX: use real terrain height
             z = self._get_terrain_height(x, y)
             if not np.isfinite(z):
                 z = self.flat_h
@@ -445,7 +456,6 @@ class RobotEnv(gym.Env):
                 ix, iy = pick_uniform_point(min_dist_cells=6)
                 x, y = world_from_cell(ix, iy)
 
-                # ✅ FIX: use raycast height
                 z0 = self._get_terrain_height(x, y)
                 if not np.isfinite(z0):
                     z0 = self.flat_h
@@ -466,7 +476,7 @@ class RobotEnv(gym.Env):
                     baseMass=0.0,
                     baseCollisionShapeIndex=col,
                     baseVisualShapeIndex=vis,
-                    basePosition=[x, y, z0 + radius * 0.8],  # ✅ slightly embedded
+                    basePosition=[x, y, z0 + radius * 0.8], 
                     baseOrientation=quat,
                 )
 
@@ -479,7 +489,6 @@ class RobotEnv(gym.Env):
                 ix, iy = pick_uniform_point(min_dist_cells=4)
                 x, y = world_from_cell(ix, iy)
 
-                # ✅ FIX: use raycast height
                 z0 = self._get_terrain_height(x, y)
                 if not np.isfinite(z0):
                     z0 = self.flat_h
@@ -501,7 +510,7 @@ class RobotEnv(gym.Env):
                     baseMass=0.0,
                     baseCollisionShapeIndex=col,
                     baseVisualShapeIndex=vis,
-                    basePosition=[x, y, z0 + sz * 0.8],  # ✅ embedded
+                    basePosition=[x, y, z0 + sz * 0.8],  
                     baseOrientation=quat,
                 )
 
@@ -563,47 +572,14 @@ class RobotEnv(gym.Env):
         )
 
     # -------------------------- obs scaling --------------------------
-    def _scale_obs(self, raw_obs: np.ndarray) -> np.ndarray:
-        scaled = raw_obs.copy()
-        scaled[0] = raw_obs[0] * 2.0
-        scaled[1] = raw_obs[1] * 2.0
-        scaled[2] = raw_obs[2] * 5.0
-        scaled[3] = raw_obs[3] / np.pi
-        scaled[6] = raw_obs[6] / 5.0
-        scaled[7] = raw_obs[7] / 5.0
-        scaled[8] = raw_obs[8] / 2.0
-        scaled[9] = raw_obs[9] / 2.0
-        scaled[10] = raw_obs[10] / 1.5
-        scaled[11] = raw_obs[11] / 1.5
-        scaled[14:] = raw_obs[14:] / 2.0
-        return scaled
-
+    def _scale_obs(self, obs: np.ndarray) -> np.ndarray:
+        # IMPORTANT: disable tanh squashing for now (debug / learning stability)
+        # You can bring normalization later once PPO works.
+        return np.asarray(obs, dtype=np.float32)
     # -------------------------- joint detection --------------------------
     def _detect_joints(self):
-        self.wheel_joints = []
-        self.steer_joints = []
-
-        num_joints = p.getNumJoints(self.robot)
-        for j in range(num_joints):
-            info = p.getJointInfo(self.robot, j)
-            name = info[1].decode("utf-8", errors="ignore").lower()
-            jtype = info[2]
-            if jtype != p.JOINT_REVOLUTE:
-                continue
-            if "steer" in name:
-                self.steer_joints.append(j)
-            elif "wheel" in name:
-                self.wheel_joints.append(j)
-
-        if len(self.wheel_joints) < 2:
-            candidates = []
-            for j in range(num_joints):
-                info = p.getJointInfo(self.robot, j)
-                name = info[1].decode("utf-8", errors="ignore").lower()
-                jtype = info[2]
-                if jtype == p.JOINT_REVOLUTE and ("steer" not in name):
-                    candidates.append(j)
-            self.wheel_joints = candidates[:4]
+        self.wheel_joints = [2, 3, 5, 7]
+        self.steer_joints = [4, 6]
 
     # -------------------------- reset --------------------------
     def reset(self, seed=None, options=None):
@@ -613,24 +589,36 @@ class RobotEnv(gym.Env):
         p.setGravity(0, 0, -9.81)
         p.setPhysicsEngineParameter(
             fixedTimeStep=1.0 / 240.0,
-            numSolverIterations=50,
-            solverResidualThreshold=1e-5,
+            numSolverIterations=80,
+            solverResidualThreshold=1e-6,
             numSubSteps=1,
             enableConeFriction=1,
         )
 
+        # Build world
         self._create_terrain()
         self._create_walls()
         self._create_goal()
 
+        # Spawn a little above flat pad
         spawn_z = self.flat_h + 0.35
+
+        # Face the goal (major help for early learning)
+        yaw = float(
+            np.arctan2(
+                self.goal_xy[1] - self.start_xy[1],
+                self.goal_xy[0] - self.start_xy[0],
+            )
+        )
+
         self.robot = p.loadURDF(
             "racecar/racecar.urdf",
-            basePosition=[float(self.start_xy[0]), float(self.start_xy[1]), spawn_z],
-            baseOrientation=p.getQuaternionFromEuler([0, 0, 0]),
+            basePosition=[float(self.start_xy[0]), float(self.start_xy[1]), float(spawn_z)],
+            baseOrientation=p.getQuaternionFromEuler([0.0, 0.0, yaw]),
             flags=p.URDF_USE_INERTIA_FROM_FILE,
         )
 
+        # Dynamics tuning (keep your values; these are safe defaults)
         num_joints = p.getNumJoints(self.robot)
         for link in range(-1, num_joints):
             p.changeDynamics(
@@ -644,8 +632,24 @@ class RobotEnv(gym.Env):
                 angularDamping=0.10,
             )
 
-        self._detect_joints()
+        # HARD-CODE correct joints (from your printed joint list)
+        self.wheel_joints = [2, 3, 5, 7]
+        self.steer_joints = [4, 6]
 
+        # Stop any default motors first (prevents weird URDF defaults)
+        for j in self.wheel_joints + self.steer_joints:
+            try:
+                p.setJointMotorControl2(
+                    self.robot,
+                    j,
+                    controlMode=p.VELOCITY_CONTROL,
+                    targetVelocity=0.0,
+                    force=0.0,
+                )
+            except Exception:
+                pass
+
+        # Apply wheel motors (velocity)
         if self.wheel_joints:
             p.setJointMotorControlArray(
                 self.robot,
@@ -655,6 +659,7 @@ class RobotEnv(gym.Env):
                 forces=[self.max_motor_force] * len(self.wheel_joints),
             )
 
+        # Apply steering motors (position)
         if self.steer_joints:
             p.setJointMotorControlArray(
                 self.robot,
@@ -664,11 +669,13 @@ class RobotEnv(gym.Env):
                 forces=[self.max_steer_force] * len(self.steer_joints),
             )
 
+        # Episode state
         self.steps = 0
         self.stuck_counter = 0
         self.prev_dist = float(np.linalg.norm(self.goal_xy - self.start_xy))
 
-        for _ in range(60):
+        # Let the car settle
+        for _ in range(80):
             p.stepSimulation()
 
         if self.render:
@@ -717,10 +724,7 @@ class RobotEnv(gym.Env):
             dtype=np.float32,
         )
 
-        sample_offsets = [
-            (1.0, 0.0), (0.7, 0.5), (0.7, -0.5), (0.3, 0.7),
-            (0.3, -0.7), (-0.3, 0.7), (-0.3, -0.7), (0.0, 0.0),
-        ]
+        sample_offsets = self.sample_offsets
 
         heights = []
         for dx, dy in sample_offsets:
@@ -794,47 +798,43 @@ class RobotEnv(gym.Env):
 
         dist = float(np.linalg.norm(self.goal_xy - pos[:2]))
 
-       # ---------------- reward ----------------
+        # ---------------- reward ----------------
         progress = self.prev_dist - dist
-        reward = progress * 4.0   # stronger signal
+        reward = progress * 6.0   
 
-        # --- heading reward (VERY IMPORTANT)
+        # heading
         to_goal = self.goal_xy - pos[:2]
         angle_to_goal = float(np.arctan2(to_goal[1], to_goal[0]))
         angle_diff = float(np.arctan2(np.sin(angle_to_goal - yaw),
                                     np.cos(angle_to_goal - yaw)))
 
         forward_speed = float(vel[0] * np.cos(yaw) + vel[1] * np.sin(yaw))
+        reward += 0.4 * forward_speed * np.cos(angle_diff)
 
-        heading_bonus = 0.3 * forward_speed * np.cos(angle_diff)
-        reward += heading_bonus
-
-        # --- alive bonus (encourage moving)
+        # alive bonus
         reward += 0.02
 
-        # --- speed penalty (prevent chaos)
-        speed = float(np.linalg.norm(vel[:2]))
-        reward -= 0.03 * speed
+        # reduce steering penalty
+        reward -= 0.005 * abs(steer)
 
-        # --- steering penalty (smooth driving)
-        reward -= 0.02 * abs(steer)
-
-        # --- wall penalty
+        # wall penalty (keep)
         lim = self.half - 0.5
         wall_dist = min(lim - abs(pos[0]), lim - abs(pos[1]))
         if wall_dist < 1.5:
-            reward -= (1.5 - wall_dist) * 0.8
+            reward -= (1.5 - wall_dist) * 0.6
 
-        # --- tilt penalty (stability)
-        reward -= 0.1 * (abs(roll) + abs(pitch))
+        # tilt penalty (reduced)
+        reward -= 0.05 * (abs(roll) + abs(pitch))
 
-        # --- step penalty (forces efficiency)
-        reward -= 0.02
+        # step penalty (small)
+        reward -= 0.005
 
+        # path penalty (weaker)
         path_dist = self._distance_to_path(pos)
+        reward -= 0.05 * path_dist
 
-        # encourage staying near path
-        reward -= 0.2 * path_dist
+        if self.stuck_counter > 0:
+            reward += 0.1 * forward_speed
         # ---------------- termination/truncation ----------------
         terminated = False
         truncated = False
@@ -861,7 +861,7 @@ class RobotEnv(gym.Env):
             self.stuck_counter = 0
 
         if self.stuck_counter >= self.max_stuck_steps:
-            reward -= 20.0
+            reward -= 100.0
             truncated = True
             self.stuck_counter = 0
 

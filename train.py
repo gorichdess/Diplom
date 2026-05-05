@@ -1,8 +1,8 @@
+import time
 import torch
 import logging
-import time
 import numpy as np
-from tqdm import tqdm
+from collections import deque
 
 from robot_env import RobotEnv
 from rl_agent import PPOAgent
@@ -20,95 +20,115 @@ def setup_logger():
 def train():
     setup_logger()
 
-    # Start with a very easy terrain
-    env = RobotEnv(render=False, difficulty=0.2)
-    agent = PPOAgent(env.obs_dim, 2)
+    # -------- Curriculum --------
+    difficulty = 0.0
+    max_difficulty = 0.2
+    diff_step = 0.05
+    diff_every_updates = 10
+    target_avg_reward = 60.0
 
-    try:
-        agent.ac.load_state_dict(torch.load("best_model.pth"))
-        print("Loaded best_model.pth. Continuing training...")
-    except FileNotFoundError:
-        print("best_model.pth not found, starting from scratch.")
+    # -------- PPO --------
+    rollout_steps = 4096
+
+    # -------- Env / Agent --------
+    env = RobotEnv(render=False, difficulty=difficulty, draw_path=False)
+    agent = PPOAgent(env.obs_dim, env.action_space.shape[0])
+
+    # -------- Tracking --------
+    ep = 0
+    ep_steps = 0
+    ep_reward = 0.0
 
     best_reward = -1e9
-    reward_window = []
+    rewards_100 = deque(maxlen=100)
 
+    updates = 0
+    total_steps = 0
+
+    obs, _ = env.reset()
     start_time = time.time()
+
     print("Training started...")
 
-    total_episodes = 4000
+    while True:
+        # ================= ROLLOUT =================
+        for _ in range(rollout_steps):
+            action, value, logp = agent.ac.get_action(obs, deterministic=False)
 
-    for ep in tqdm(range(total_episodes)):
-        # Curriculum: difficulty rises to 1.3 over 2000 episodes
-        difficulty = min(1.0, 0.2 + 0.8 * (ep / 2000))   # reaches 1.5 at episode 2500
-        env.difficulty = difficulty
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
 
-        # Entropy decay (keeps exploration early, more greedy later)
-        ent_coef = 0.05 * (1.0 - ep / total_episodes) + 0.01
-        agent.set_entropy_coef(ent_coef)
+            agent.store((obs, action, logp, reward, float(done), value))
 
-        state, _ = env.reset()
-        done = False
-        ep_reward = 0
-        ep_steps = 0
-
-        while not done:
-            action, value, logp = agent.ac.get_action(state)
-            next_state, reward, term, trunc, _ = env.step(action)
-            done_flag = term or trunc
-            agent.store((
-                state,
-                action,
-                logp,
-                reward,
-                done_flag,
-                value
-            ))
-            state = next_state
-            ep_reward += reward
+            obs = next_obs
+            ep_reward += float(reward)
             ep_steps += 1
-            done = done_flag
+            total_steps += 1
 
-        loss = agent.update()
+            if done:
+                rewards_100.append(ep_reward)
 
-        reward_window.append(ep_reward)
-        if len(reward_window) > 100:
-            reward_window.pop(0)
+                print(f"EP {ep:05d} | Reward {ep_reward:8.2f} | Steps {ep_steps}")
 
-        avg100 = np.mean(reward_window)
+                if ep_reward > best_reward:
+                    best_reward = ep_reward
+                    torch.save(agent.ac.state_dict(), "best_model.pth")
+                    print(f"Saved BEST model: {best_reward:.2f}")
 
-        if ep_reward > best_reward:
-            best_reward = ep_reward
-            torch.save(agent.ac.state_dict(), "best_model.pth")
+                ep += 1
+                ep_steps = 0
+                ep_reward = 0.0
 
-        if ep % 250 == 0:
-            torch.save(agent.ac.state_dict(), f"checkpoint_{ep}.pth")
+                obs, _ = env.reset()
 
+        # ================= PPO UPDATE =================
+        last_value = agent.value_of(obs)  # must be used inside update!
+        loss = agent.update(last_value=last_value)
+        updates += 1
+
+        # ================= STATS =================
         elapsed = time.time() - start_time
+        avg100 = np.mean(rewards_100) if len(rewards_100) > 0 else 0.0
 
         log_line = (
-            f"EP {ep:04d} | "
-            f"Reward {ep_reward:8.2f} | "
+            f"UPD {updates:04d} | "
+            f"EP {ep:05d} | "
             f"Avg100 {avg100:8.2f} | "
             f"Best {best_reward:8.2f} | "
-            f"Steps {ep_steps:4d} | "
             f"Loss {loss:8.4f} | "
             f"Diff {difficulty:4.2f} | "
+            f"Ent {agent.entropy_coef:6.4f} | "
+            f"Steps {ep_steps:8d} | "
             f"Time {elapsed:8.1f}s"
         )
 
+        print(log_line)
         logging.info(log_line)
 
-        if ep % 20 == 0:
-            print(log_line)
+        # ================= CHECKPOINT =================
+        if updates % 10 == 0:
+            torch.save(agent.ac.state_dict(), f"checkpoint_upd_{updates}.pth")
+            print(f"💾 Checkpoint saved at update {updates}")
 
-    torch.save(agent.ac.state_dict(), "final_model.pth")
+        # ================= ENTROPY DECAY =================
+        agent.entropy_coef = max(0.005, agent.entropy_coef * 0.995)
 
-    print("Training finished.")
-    print("Saved:")
-    print(" - training.log")
-    print(" - best_model.pth")
-    print(" - final_model.pth")
+        # ================= CURRICULUM =================
+        if (
+            updates % diff_every_updates == 0
+            and len(rewards_100) == rewards_100.maxlen
+            and avg100 > target_avg_reward
+        ):
+            if difficulty < max_difficulty:
+                difficulty = min(max_difficulty, difficulty + diff_step)
+
+                env.close()
+                env = RobotEnv(render=False, difficulty=difficulty, draw_path=False)
+                obs, _ = env.reset()
+
+                msg = f"🔥 Difficulty increased to {difficulty:.2f}"
+                print(msg)
+                logging.info(msg)
 
 
 if __name__ == "__main__":
