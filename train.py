@@ -38,6 +38,7 @@ def train():
     ep = 0
     ep_steps = 0
     ep_reward = 0.0
+    num_of_ep=5000
 
     best_reward = -1e9
     rewards_100 = deque(maxlen=100)
@@ -50,7 +51,7 @@ def train():
 
     print("Training started...")
 
-    while True:
+    while ep < num_of_ep:
         # ================= ROLLOUT =================
         for _ in range(rollout_steps):
             action, value, logp = agent.ac.get_action(obs, deterministic=False)
@@ -82,7 +83,7 @@ def train():
                 obs, _ = env.reset()
 
         # ================= PPO UPDATE =================
-        last_value = agent.value_of(obs)  # must be used inside update!
+        last_value = agent.value_of(obs)
         loss = agent.update(last_value=last_value)
         updates += 1
 
@@ -108,10 +109,10 @@ def train():
         # ================= CHECKPOINT =================
         if updates % 10 == 0:
             torch.save(agent.ac.state_dict(), f"checkpoint_upd_{updates}.pth")
-            print(f"💾 Checkpoint saved at update {updates}")
+            print(f"Checkpoint saved at update {updates}")
 
         # ================= ENTROPY DECAY =================
-        agent.entropy_coef = max(0.005, agent.entropy_coef * 0.995)
+        agent.entropy_coef = max(0.005, agent.entropy_coef * 0.999)
 
         # ================= CURRICULUM =================
         if (
@@ -126,7 +127,7 @@ def train():
                 env = RobotEnv(render=False, difficulty=difficulty, draw_path=False)
                 obs, _ = env.reset()
 
-                msg = f"🔥 Difficulty increased to {difficulty:.2f}"
+                msg = f"Difficulty increased to {difficulty:.2f}"
                 print(msg)
                 logging.info(msg)
 

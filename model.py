@@ -17,21 +17,21 @@ class ActorCritic(nn.Module):
             nn.init.constant_(layer.bias, 0.0)
             return layer
 
-        # Actor outputs mean in *pre-tanh* space
+        # Increased hidden layers to 512 for better feature extraction
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
+            layer_init(nn.Linear(obs_dim, 512)),
             nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(512, 512)),
             nn.ReLU(),
-            layer_init(nn.Linear(256, action_dim), gain=0.01),
+            layer_init(nn.Linear(512, action_dim), gain=0.01),
         )
 
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
+            layer_init(nn.Linear(obs_dim, 512)),
             nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(512, 512)),
             nn.ReLU(),
-            layer_init(nn.Linear(256, 1)),
+            layer_init(nn.Linear(512, 1)),
         )
 
         # Learnable log_std (one per action dim)

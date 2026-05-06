@@ -11,7 +11,7 @@ class PPOAgent:
 
         self.lr = 1e-4
         self.epochs = 10
-        self.batch_size = 256
+        self.batch_size = 512
 
         self.entropy_coef = 0.05
         self.value_coef = 0.5

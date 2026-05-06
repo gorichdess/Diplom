@@ -26,18 +26,18 @@ class RobotEnv(gym.Env):
         # Action: [throttle, steer] in [-1, 1]
         self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
 
-        self.sample_offsets = [
-            (1.5, 0.0),
-            (1.0, 0.5),
-            (1.0, -0.5),
-            (0.5, 1.0),
-            (0.5, -1.0),
-            (0.0, 1.5),
-            (0.0, -1.5),
-            (-0.5, 1.0),
-            (-0.5, -1.0),
-            (0.0, 0.0),
-        ]
+        # Create a denser local grid + some long-range "look ahead"
+        self.sample_offsets = []
+    
+        # Rows at 0.2m, 0.5m (Close), 1.5m (Medium), and 3.5m (Far)
+        for x in [0.2, 0.5, 1.5, 3.5]: 
+            # Spread Y based on distance: wider vision for further rows
+            y_spread = 0.5 if x < 1.0 else 1.2
+            for y in np.linspace(-y_spread, y_spread, 5):
+                self.sample_offsets.append((x, float(y)))
+
+        self.sample_offsets.append((0.0, 0.0))
+
         # Obs: 14 base + 8 terrain samples
         self.obs_dim = 14 + len(self.sample_offsets)
         self.observation_space = spaces.Box(
@@ -85,7 +85,7 @@ class RobotEnv(gym.Env):
         self.steer_joints = []
 
         # Controls
-        self.max_wheel_speed = 18.0
+        self.max_wheel_speed = 20.0
         self.max_motor_force = 300.0
         self.max_steer_angle = 0.35
         self.max_steer_force = 80.0
@@ -702,41 +702,29 @@ class RobotEnv(gym.Env):
         dist = float(np.linalg.norm(to_goal))
         angle_to_goal = float(np.arctan2(to_goal[1], to_goal[0]))
         angle_diff = float(np.arctan2(np.sin(angle_to_goal - yaw),
-                                      np.cos(angle_to_goal - yaw)))
+                                    np.cos(angle_to_goal - yaw)))
 
-        raw_obs = np.array(
-            [
-                to_goal[0] * 0.1,
-                to_goal[1] * 0.1,
-                dist * 0.1,
-                angle_diff,
-                np.sin(yaw),
-                np.cos(yaw),
-                vel[0],
-                vel[1],
-                ang[2],
-                pos[2],
-                roll,
-                pitch,
-                self.steps / 1000.0,
-                1.0,
-            ],
-            dtype=np.float32,
-        )
+        # Base observation features
+        raw_obs = [
+            to_goal[0] * 0.1, to_goal[1] * 0.1, dist * 0.1,
+            angle_diff, np.sin(yaw), np.cos(yaw),
+            vel[0], vel[1], ang[2], pos[2],
+            roll, pitch, self.steps / 1000.0, 1.0
+        ]
 
-        sample_offsets = self.sample_offsets
-
+        # Calculate terrain heights for the expanded sample_offsets[cite: 3]
         heights = []
-        for dx, dy in sample_offsets:
+        for dx, dy in self.sample_offsets:
+            # Rotate offsets based on car's current yaw
             wx = pos[0] + dx * np.cos(yaw) - dy * np.sin(yaw)
             wy = pos[1] + dx * np.sin(yaw) + dy * np.cos(yaw)
+            
             h = self._get_terrain_height(float(wx), float(wy))
-            heights.append(h - float(pos[2]))
+            heights.append(h - float(pos[2])) # Height relative to car
 
-        heights = np.asarray(heights, dtype=np.float32)
-        raw_obs = np.concatenate([raw_obs, heights], axis=0)
-
-        obs = self._scale_obs(raw_obs)
+        raw_obs.extend(heights)
+        obs = np.array(raw_obs, dtype=np.float32)
+        
         return self._safe_obs(obs, clip=50.0)
     
     def _distance_to_path(self, pos):
@@ -812,7 +800,7 @@ class RobotEnv(gym.Env):
         reward += 0.4 * forward_speed * np.cos(angle_diff)
 
         # alive bonus
-        reward += 0.02
+        #reward += 0.02
 
         # reduce steering penalty
         reward -= 0.005 * abs(steer)
@@ -839,7 +827,7 @@ class RobotEnv(gym.Env):
         terminated = False
         truncated = False
 
-        if dist < 1.2:
+        if dist < 2.0:
             reward += 150.0
             terminated = True
 
