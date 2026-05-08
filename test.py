@@ -9,13 +9,13 @@ def test():
     # 1. Initialize Environment
     # You can change the difficulty here (e.g., 0.1 for easy, 0.8 for hard)
     # Default is 0.3 if not specified
-    target_difficulty = 0.3
+    target_difficulty = 1.0
     env = RobotEnv(render=True, difficulty=target_difficulty)
     
     # 2. Load Model
     model = ActorCritic(env.obs_dim, 2)
     try:
-        model.load_state_dict(torch.load("checkpoint_upd_220.pth", map_location="cpu"))
+        model.load_state_dict(torch.load("upds/best_model.pth", map_location="cpu"))
         print(f"Successfully loaded best_model.pth")
     except FileNotFoundError:
         print("Warning: best_model.pth not found. Testing with random weights.")
@@ -23,7 +23,7 @@ def test():
     model.eval()
 
     # 3. Access and Display Difficulty
-    current_diff = env.difficulty  # Access the difficulty attribute[cite: 3]
+    current_diff = env.difficulty
     print(f"\n--- TEST SETTINGS ---")
     print(f"Difficulty: {current_diff}")
     print(f"Observation Dimension: {env.obs_dim}")
@@ -31,7 +31,7 @@ def test():
     # 4. Run Test Episode
     state, _ = env.reset()
     
-    # Add a visual label in the PyBullet window[cite: 3]
+    # Add a visual label in the PyBullet window
     p.addUserDebugText(
         f"Difficulty: {current_diff:.2f}", 
         [0, 0, 2.5], 

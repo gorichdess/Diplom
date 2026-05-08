@@ -28,6 +28,11 @@ class PPOAgent:
 
     def set_entropy_coef(self, coef):
         self.entropy_coef = float(coef)
+        
+    def set_lr(self, lr):
+        self.lr = float(lr)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.lr
 
     @torch.no_grad()
     def value_of(self, obs):
@@ -52,12 +57,12 @@ class PPOAgent:
         dones = np.array([m[4] for m in self.memory], dtype=np.float32)
         values = np.array([m[5] for m in self.memory], dtype=np.float32)
 
-        # ---- safety
+        # ---- safety (removed action clipping since they are now unbounded standard normals)
         states = torch.nan_to_num(states, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-        actions = torch.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        actions = torch.nan_to_num(actions, nan=0.0, posinf=10.0, neginf=-10.0) 
         old_logp = torch.nan_to_num(old_logp, nan=-20.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
 
-        # ---- GAE with BOOTSTRAP (major fix)
+        # ---- GAE with BOOTSTRAP
         values_ext = np.append(values, float(last_value))
         returns = np.zeros_like(rewards, dtype=np.float32)
         advantages = np.zeros_like(rewards, dtype=np.float32)

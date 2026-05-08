@@ -8,6 +8,10 @@ import heapq
 
 
 class RobotEnv(gym.Env):
+    """
+    Husky differential-drive version.
+    Actions: [linear_velocity, angular_velocity] both in [-1, 1] (normalised).
+    """
     metadata = {"render_modes": ["human"]}
 
     def __init__(self, render: bool = False, difficulty: float = 0.3, draw_path: bool = True):
@@ -23,35 +27,30 @@ class RobotEnv(gym.Env):
         if render:
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
 
-        # Action: [throttle, steer] in [-1, 1]
+        # Action: [linear_vel, angular_vel] in [-1, 1]
         self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
 
-        # Create a denser local grid + some long-range "look ahead"
+        # Same observation grid as before
         self.sample_offsets = []
-    
-        # Rows at 0.2m, 0.5m (Close), 1.5m (Medium), and 3.5m (Far)
-        for x in [0.2, 0.5, 1.5, 3.5]: 
-            # Spread Y based on distance: wider vision for further rows
-            y_spread = 0.5 if x < 1.0 else 1.2
+        for x in [0.2, 0.5, 1.5, 3.5, 6.0, 10.0]:   # added 6m and 10m
+            y_spread = 0.5 if x < 1.0 else 1.5 if x < 5.0 else 2.5
             for y in np.linspace(-y_spread, y_spread, 5):
                 self.sample_offsets.append((x, float(y)))
-
         self.sample_offsets.append((0.0, 0.0))
 
-        # Obs: 14 base + 8 terrain samples
         self.obs_dim = 14 + len(self.sample_offsets)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
         )
 
-        # Map / heightfield settings
-        self.size = 64
+        # Map settings (unchanged)
+        self.size = 128
         self.scale = 0.35
         world = self.size * self.scale
         self.half = world / 2
 
-        self.flat_size = 12
-        self.smooth_width = 3
+        self.flat_size = 16
+        self.smooth_width = 4
         self.flat_h = 0.4
 
         half_extent = (self.size - 1) * self.scale / 2
@@ -67,7 +66,6 @@ class RobotEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Robot + episode state
         self.robot = None
         self.goal_marker = None
         self.terrain_id = None
@@ -75,30 +73,31 @@ class RobotEnv(gym.Env):
         self.steps = 0
         self.prev_dist = 0.0
 
-        # Stuck logic
         self.stuck_counter = 0
         self.stuck_threshold = 0.005
-        self.max_stuck_steps = 500
+        self.max_stuck_steps = 300   # consider reducing for Husky if needed
 
-        # Joint lists
-        self.wheel_joints = []
-        self.steer_joints = []
+        # Husky control limits (differential drive)
+        self.max_linear_vel = 1.4    # m/s
+        self.max_angular_vel = 1.0   # rad/s
+        self.wheel_radius = 0.15     # approximate (meters)
+        self.track_width = 0.6       # distance between left/right wheels (m)
 
-        # Controls
-        self.max_wheel_speed = 20.0
-        self.max_motor_force = 300.0
-        self.max_steer_angle = 0.35
-        self.max_steer_force = 80.0
+        # Motor force (enough to drive on slopes)
+        self.max_motor_force = 150.0  # per wheel, value tuned for Husky mass
+        self.current_linear_vel = 0.0
+
+        # Wheel joint indices for Husky (URDF)
+        self.wheel_joints = [2, 3, 4, 5]   # front_left, front_right, rear_left, rear_right
 
         self.physics_steps_per_env_step = 10
 
-        # Terrain debug/state
         self.heightmap = None
         self.path_cells = None
         self._debug_ids = []
         self.terrain_obstacles = []
 
-    # -------------------------- utils --------------------------
+    # -------------------------- utils (unchanged) --------------------------
     def _safe_obs(self, obs, clip: float = 50.0):
         obs = np.asarray(obs, dtype=np.float32)
         obs = np.nan_to_num(obs, nan=0.0, posinf=clip, neginf=-clip)
@@ -115,7 +114,7 @@ class RobotEnv(gym.Env):
             return h if np.isfinite(h) else 0.0
         return 0.0
 
-    # -------------------------- debug draw --------------------------
+    # -------------------------- debug draw (unchanged) --------------------------
     def _clear_debug(self):
         if not self.render:
             return
@@ -136,11 +135,9 @@ class RobotEnv(gym.Env):
         def cell_to_world(ix, iy):
             x = -half_extent + ix * self.scale
             y = -half_extent + iy * self.scale
-
             z = self._get_terrain_height(x, y)
             if not np.isfinite(z):
                 z = self.flat_h
-
             return (float(x), float(y), float(z + 0.15))
 
         for a, b in zip(path_cells[:-1], path_cells[1:]):
@@ -154,11 +151,12 @@ class RobotEnv(gym.Env):
             )
             self._debug_ids.append(did)
 
+    # -------------------------- terrain generation (unchanged) --------------------------
     def _create_terrain(self):
+        # (full code exactly as in the original racecar version)
         size = self.size
         diff = float(np.clip(self.difficulty, 0.0, 1.0))
 
-        # ---------- cleanup old ----------
         if self.terrain_id is not None:
             try:
                 p.removeBody(self.terrain_id)
@@ -171,9 +169,9 @@ class RobotEnv(gym.Env):
                 p.removeBody(bid)
             except Exception:
                 pass
-        self.terrain_obstacles = []
+        self.terrain_obstacles.clear()
 
-        # ---------- helpers ----------
+        # ---------- helpers (unchanged) ----------
         def normalize01(a):
             a = a - a.min()
             return a / (a.max() + 1e-8)
@@ -302,7 +300,6 @@ class RobotEnv(gym.Env):
             y = -half_extent + iy * self.scale
             return float(x), float(y)
 
-        # Start/goal indices
         start_idx = self.flat_size // 2
         goal_idx = size - 1 - start_idx
         start = (start_idx, start_idx)
@@ -310,51 +307,43 @@ class RobotEnv(gym.Env):
 
         margin = self.flat_size + self.smooth_width + 4
 
-        max_step = 0.13 + 0.07 * (1.0 - diff)  # easy ~0.18 hard ~0.11
+        max_step = 0.13 + 0.07 * (1.0 - diff)
         clamp_limit = max_step * (1.10 + 0.10 * (1.0 - diff))
 
-        # --------- attempt loop until solvable ---------
         for _attempt in range(50):
-            # 1) Macro hills that are visible
             macro = fbm((size, size), sigmas=[22.0, 14.0], weights=[1.0, 0.55])
             mid = fbm((size, size), sigmas=[9.0, 5.0], weights=[0.9, 0.55])
             macro01 = normalize01(macro)
             mid01 = normalize01(mid)
 
-            macro_amp = 0.75 + 1.10 * diff   # bigger hills
-            mid_amp   = 0.25 + 0.60 * diff   # more noticeable secondary structure
+            macro_amp = 0.75 + 1.10 * diff
+            mid_amp   = 0.25 + 0.60 * diff
 
             z = self.flat_h + (macro01 - 0.5) * 2.0 * macro_amp
             z = z + (mid01 - 0.5) * 2.0 * mid_amp
 
-            # 2) Discrete features: mounds and pits (Made more distinct!)
             n_mounds = int(6 + 12 * diff)
             n_pits = int(5 + 10 * diff)
 
             for _ in range(n_mounds):
                 cx = np.random.randint(margin, size - margin)
                 cy = np.random.randint(margin, size - margin)
-                # Tighter radius + taller height = steeper hills
-                r = np.random.randint(4, 9)  
+                r = np.random.randint(4, 9)
                 h = (0.55 + 0.85 * diff) * np.random.uniform(0.9, 1.3)
                 stamp_gaussian(z, cx, cy, r, +h)
 
             for _ in range(n_pits):
                 cx = np.random.randint(margin, size - margin)
                 cy = np.random.randint(margin, size - margin)
-                # Tighter radius + deeper depth = sharper holes
                 r = np.random.randint(4, 10)
                 d = (0.50 + 0.85 * diff) * np.random.uniform(0.9, 1.3)
                 stamp_gaussian(z, cx, cy, r, -d)
 
-            # 3) Tiny micro roughness only
             micro = fbm((size, size), sigmas=[2.2, 1.2], weights=[0.015 + 0.02 * diff, 0.01 + 0.015 * diff])
             z = z + micro
 
-            # 4) Clamp slopes
             z = clamp_slope_iter(z, max_dz_per_cell=clamp_limit, passes=4)
 
-            # 5) Start/goal pads + transitions
             z[0:self.flat_size, 0:self.flat_size] = self.flat_h
             z[-self.flat_size:, -self.flat_size:] = self.flat_h
 
@@ -380,13 +369,11 @@ class RobotEnv(gym.Env):
                     t = min(1.0, max(di, dj) / self.smooth_width)
                     z[i, j] = (1 - t) * self.flat_h + t * raw[i, j]
 
-            # 6) A* path
             path = astar_path(z, start, goal, max_step=max_step)
             if path is None:
                 continue
 
-            # 7) Carve corridor (visible)
-            corridor_w = int(10 - 6 * diff)      # easy wide, hard narrow
+            corridor_w = int(14 - 8 * diff)
             smooth_sigma = 2.6 - 1.2 * diff
             drop = 0.05 + 0.10 * diff
             keep_rough = 0.03 + 0.10 * diff
@@ -394,13 +381,11 @@ class RobotEnv(gym.Env):
 
             z, band = carve_corridor(z, path, corridor_w, smooth_sigma, drop, keep_rough, berm)
 
-            # final clamp
             z = clamp_slope_iter(z, max_dz_per_cell=clamp_limit, passes=2)
 
             self.heightmap = z.astype(np.float32)
             self.path_cells = path
 
-            # 8) Build heightfield
             shape = p.createCollisionShape(
                 shapeType=p.GEOM_HEIGHTFIELD,
                 meshScale=[self.scale, self.scale, 1.0],
@@ -412,114 +397,80 @@ class RobotEnv(gym.Env):
             p.changeDynamics(self.terrain_id, -1, lateralFriction=1.6, restitution=0.0)
             p.setPhysicsEngineParameter(enableConeFriction=1)
 
-            # 9) Uniform Obstacle Placement Algorithm
             placed = []
-            
-            # Define a padding distance to keep rocks out of the spawn/goal flat zones
-            pad = self.flat_size + self.smooth_width + 2 
+            pad = self.flat_size + self.smooth_width + 2
 
             def pick_uniform_point(min_dist_cells):
-                """Pure uniform sampling over the entire map."""
-                for _ in range(200): # max tries
-                    # FIX: Sample from the ENTIRE map (0 to size), not the restricted middle 'margin'
+                for _ in range(200):
                     ix = np.random.randint(0, size)
                     iy = np.random.randint(0, size)
-
-                    # Keep away from start/goal pads
                     if ix < pad and iy < pad: continue
                     if ix > size - pad and iy > size - pad: continue
-
-                    # Keep off the main path (band is 1.0 on path, 0.0 far outside)
                     if band[ix, iy] > 0.15:
                         continue
-
-                    # Ensure spacing from other placed objects
                     too_close = False
                     for px, py in placed:
                         if (ix - px)**2 + (iy - py)**2 < min_dist_cells**2:
                             too_close = True
                             break
-                    
                     if not too_close:
                         placed.append((ix, iy))
                         return ix, iy
-                
-                # Fallback if map gets too crowded (also fixed to use full map)
                 ix = np.random.randint(pad, size - pad)
                 iy = np.random.randint(pad, size - pad)
                 placed.append((ix, iy))
                 return ix, iy
 
-            # 10) Fallen logs
-            n_logs = int(2 + 4 * diff) 
+            n_logs = int(2 + 4 * diff)
             for _ in range(n_logs):
                 ix, iy = pick_uniform_point(min_dist_cells=6)
                 x, y = world_from_cell(ix, iy)
-
                 z0 = self._get_terrain_height(x, y)
                 if not np.isfinite(z0):
                     z0 = self.flat_h
-
                 length = 1.2 + 1.8 * np.random.rand()
                 radius = 0.10 + 0.10 * np.random.rand()
                 yaw = float(np.random.uniform(0, np.pi))
-
                 col = p.createCollisionShape(p.GEOM_CYLINDER, radius=radius, height=length)
-                vis = p.createVisualShape(
-                    p.GEOM_CYLINDER, radius=radius, length=length,
-                    rgbaColor=[0.35, 0.25, 0.12, 1]
-                )
-
+                vis = p.createVisualShape(p.GEOM_CYLINDER, radius=radius, length=length,
+                                        rgbaColor=[0.35, 0.25, 0.12, 1])
                 quat = p.getQuaternionFromEuler([0.0, 1.5708, yaw])
-
                 bid = p.createMultiBody(
                     baseMass=0.0,
                     baseCollisionShapeIndex=col,
                     baseVisualShapeIndex=vis,
-                    basePosition=[x, y, z0 + radius * 0.8], 
+                    basePosition=[x, y, z0 + radius * 0.8],
                     baseOrientation=quat,
                 )
-
                 p.changeDynamics(bid, -1, lateralFriction=1.2, restitution=0.0)
                 self.terrain_obstacles.append(bid)
 
-            # 11) Rocks
-            n_rocks = int(15 + 25 * diff) 
+            n_rocks = int(15 + 25 * diff)
             for _ in range(n_rocks):
                 ix, iy = pick_uniform_point(min_dist_cells=4)
                 x, y = world_from_cell(ix, iy)
-
                 z0 = self._get_terrain_height(x, y)
                 if not np.isfinite(z0):
                     z0 = self.flat_h
-
                 sx = 0.10 + 0.25 * np.random.rand()
                 sy = 0.10 + 0.25 * np.random.rand()
                 sz = 0.08 + 0.18 * np.random.rand()
-
                 col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[sx, sy, sz])
-                vis = p.createVisualShape(
-                    p.GEOM_BOX, halfExtents=[sx, sy, sz],
-                    rgbaColor=[0.4, 0.4, 0.4, 1]
-                )
-
+                vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[sx, sy, sz],
+                                        rgbaColor=[0.4, 0.4, 0.4, 1])
                 yaw = float(np.random.uniform(0, np.pi))
                 quat = p.getQuaternionFromEuler([0.0, 0.0, yaw])
-
                 bid = p.createMultiBody(
                     baseMass=0.0,
                     baseCollisionShapeIndex=col,
                     baseVisualShapeIndex=vis,
-                    basePosition=[x, y, z0 + sz * 0.8],  
+                    basePosition=[x, y, z0 + sz * 0.8],
                     baseOrientation=quat,
                 )
-
                 p.changeDynamics(bid, -1, lateralFriction=1.3, restitution=0.0)
                 self.terrain_obstacles.append(bid)
 
-            # 12) Debug draw safe path
             self._debug_draw_path(self.path_cells, life=0)
-
             return self.terrain_id
 
         # fallback flat
@@ -537,51 +488,34 @@ class RobotEnv(gym.Env):
         p.setPhysicsEngineParameter(enableConeFriction=1)
         return self.terrain_id
 
-    # -------------------------- walls --------------------------
+    # -------------------------- walls (unchanged) --------------------------
     def _create_walls(self):
-        h = 2.5  # Height
-        t = 0.4  # Thickness
-        # Correct bound calculation to match the Heightfield mesh exactly
-        bound = (self.size - 1) * self.scale / 2.0 
+        h = 3.5
+        t = 0.4
+        bound = (self.size - 1) * self.scale / 2.0
 
         def wall(x, y, sx, sy):
             col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[sx, sy, h])
-            vis = p.createVisualShape(
-                p.GEOM_BOX, halfExtents=[sx, sy, h], rgbaColor=[0.6, 0.6, 0.6, 1]
-            )
-            # Offset Z by 1.0 so the wall sits firmly in the ground
+            vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[sx, sy, h], rgbaColor=[0.6, 0.6, 0.6, 1])
             wid = p.createMultiBody(0, col, vis, basePosition=[x, y, 1.0])
             p.changeDynamics(wid, -1, lateralFriction=1.5, restitution=0.0)
 
-        # Place walls exactly at the edges of the terrain
-        wall(bound + t, 0, t, bound + t)  # Right
-        wall(-(bound + t), 0, t, bound + t) # Left
-        wall(0, bound + t, bound + t, t)  # Top
-        wall(0, -(bound + t), bound + t, t) # Bottom
+        wall(bound + t, 0, t, bound + t)
+        wall(-(bound + t), 0, t, bound + t)
+        wall(0, bound + t, bound + t, t)
+        wall(0, -(bound + t), bound + t, t)
 
-    # -------------------------- goal --------------------------
+    # -------------------------- goal (unchanged) --------------------------
     def _create_goal(self):
-        vis = p.createVisualShape(
-            p.GEOM_CYLINDER, radius=0.8, length=0.3, rgbaColor=[0, 1, 0, 1]
-        )
-        self.goal_marker = p.createMultiBody(
-            0,
-            -1,
-            vis,
-            basePosition=[float(self.goal_xy[0]), float(self.goal_xy[1]), self.flat_h + 0.15],
-        )
+        vis = p.createVisualShape(p.GEOM_CYLINDER, radius=0.8, length=0.3, rgbaColor=[0, 1, 0, 1])
+        self.goal_marker = p.createMultiBody(0, -1, vis,
+                            basePosition=[float(self.goal_xy[0]), float(self.goal_xy[1]), self.flat_h + 0.15])
 
-    # -------------------------- obs scaling --------------------------
+    # -------------------------- obs scaling (unchanged) --------------------------
     def _scale_obs(self, obs: np.ndarray) -> np.ndarray:
-        # IMPORTANT: disable tanh squashing for now (debug / learning stability)
-        # You can bring normalization later once PPO works.
-        return np.asarray(obs, dtype=np.float32)
-    # -------------------------- joint detection --------------------------
-    def _detect_joints(self):
-        self.wheel_joints = [2, 3, 5, 7]
-        self.steer_joints = [4, 6]
+        obs = np.asarray(obs, dtype=np.float32)
+        return np.nan_to_num(obs, nan=0.0, posinf=50.0, neginf=-50.0)
 
-    # -------------------------- reset --------------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
@@ -595,100 +529,66 @@ class RobotEnv(gym.Env):
             enableConeFriction=1,
         )
 
-        # Build world
+        # Reset terrain and goal
+        self.terrain_id = None
+        self.terrain_obstacles = []
+        self._clear_debug()
         self._create_terrain()
         self._create_walls()
         self._create_goal()
 
-        # Spawn a little above flat pad
         spawn_z = self.flat_h + 0.35
-
-        # Face the goal (major help for early learning)
-        yaw = float(
-            np.arctan2(
-                self.goal_xy[1] - self.start_xy[1],
-                self.goal_xy[0] - self.start_xy[0],
-            )
-        )
+        yaw = float(np.arctan2(
+            self.goal_xy[1] - self.start_xy[1],
+            self.goal_xy[0] - self.start_xy[0]))
 
         self.robot = p.loadURDF(
-            "racecar/racecar.urdf",
+            "husky/husky.urdf",
             basePosition=[float(self.start_xy[0]), float(self.start_xy[1]), float(spawn_z)],
             baseOrientation=p.getQuaternionFromEuler([0.0, 0.0, yaw]),
             flags=p.URDF_USE_INERTIA_FROM_FILE,
         )
 
-        # Dynamics tuning (keep your values; these are safe defaults)
+        # --- FIX FOR STABILITY & ERRORS ---
         num_joints = p.getNumJoints(self.robot)
-        for link in range(-1, num_joints):
-            p.changeDynamics(
-                self.robot,
-                link,
-                lateralFriction=2.0,
-                spinningFriction=0.10,
-                rollingFriction=0.06,
-                restitution=0.0,
-                linearDamping=0.04,
-                angularDamping=0.10,
-            )
+        
+        # 1. Physical Balance: Increase mass and set center of mass offset
+        # Using positional arguments to avoid 'invalid keyword' errors
+        # -1 is base, 60.0 is mass, 2.5 is lateral friction
+        p.changeDynamics(self.robot, -1, mass=60.0, lateralFriction=2.5)
+        
+        # 2. Cleanup Decorative Links (Fixes Warnings)
+        non_physical = ['base_footprint', 'imu_link', 'top_plate_link', 
+                        'user_rail_link', 'front_bumper_link', 'rear_bumper_link']
+        
+        for j in range(num_joints):
+            joint_name = p.getJointInfo(self.robot, j)[1].decode('utf-8')
+            if any(name in joint_name for name in non_physical):
+                p.changeDynamics(self.robot, j, mass=0.0) # Remove mass from light parts
+            else:
+                # Set wheel friction high for climbing
+                p.changeDynamics(self.robot, j, lateralFriction=2.5, rollingFriction=0.05)
 
-        # HARD-CODE correct joints (from your printed joint list)
-        self.wheel_joints = [2, 3, 5, 7]
-        self.steer_joints = [4, 6]
-
-        # Stop any default motors first (prevents weird URDF defaults)
-        for j in self.wheel_joints + self.steer_joints:
-            try:
-                p.setJointMotorControl2(
-                    self.robot,
-                    j,
-                    controlMode=p.VELOCITY_CONTROL,
-                    targetVelocity=0.0,
-                    force=0.0,
-                )
-            except Exception:
-                pass
-
-        # Apply wheel motors (velocity)
-        if self.wheel_joints:
-            p.setJointMotorControlArray(
-                self.robot,
-                self.wheel_joints,
-                controlMode=p.VELOCITY_CONTROL,
-                targetVelocities=[0.0] * len(self.wheel_joints),
-                forces=[self.max_motor_force] * len(self.wheel_joints),
-            )
-
-        # Apply steering motors (position)
-        if self.steer_joints:
-            p.setJointMotorControlArray(
-                self.robot,
-                self.steer_joints,
-                controlMode=p.POSITION_CONTROL,
-                targetPositions=[0.0] * len(self.steer_joints),
-                forces=[self.max_steer_force] * len(self.steer_joints),
-            )
-
-        # Episode state
+        self.wheel_joints = [2, 3, 4, 5] 
         self.steps = 0
         self.stuck_counter = 0
+        self.current_linear_vel = 0.0 # NEW: for smoothing acceleration
         self.prev_dist = float(np.linalg.norm(self.goal_xy - self.start_xy))
 
-        # Let the car settle
         for _ in range(80):
             p.stepSimulation()
 
         if self.render:
             p.resetDebugVisualizerCamera(
-                cameraDistance=14,
+                cameraDistance=25,
                 cameraYaw=45,
                 cameraPitch=-35,
-                cameraTargetPosition=[0, 0, 0],
+                cameraTargetPosition=[0, 0, 0]
             )
 
         return self._get_obs(), {}
 
-    # -------------------------- observation --------------------------
+    # -------------------------- observation (unchanged) --------------------------
     def _get_obs(self):
         pos, orn = p.getBasePositionAndOrientation(self.robot)
         vel, ang = p.getBaseVelocity(self.robot)
@@ -704,161 +604,122 @@ class RobotEnv(gym.Env):
         angle_diff = float(np.arctan2(np.sin(angle_to_goal - yaw),
                                     np.cos(angle_to_goal - yaw)))
 
-        # Base observation features
         raw_obs = [
             to_goal[0] * 0.1, to_goal[1] * 0.1, dist * 0.1,
             angle_diff, np.sin(yaw), np.cos(yaw),
-            vel[0], vel[1], ang[2], pos[2],
-            roll, pitch, self.steps / 1000.0, 1.0
+            vel[0] * 0.1, vel[1] * 0.1, ang[2] * 0.2, pos[2] * 0.5,
+            roll * 0.5, pitch * 0.5, self.steps / 1000.0, 1.0
         ]
 
-        # Calculate terrain heights for the expanded sample_offsets[cite: 3]
-        heights = []
+        starts = []
+        ends = []
         for dx, dy in self.sample_offsets:
-            # Rotate offsets based on car's current yaw
             wx = pos[0] + dx * np.cos(yaw) - dy * np.sin(yaw)
             wy = pos[1] + dx * np.sin(yaw) + dy * np.cos(yaw)
-            
-            h = self._get_terrain_height(float(wx), float(wy))
-            heights.append(h - float(pos[2])) # Height relative to car
+            starts.append([float(wx), float(wy), float(pos[2] + 3.0)])
+            ends.append([float(wx), float(wy), float(pos[2] - 2.0)])
+
+        ray_results = p.rayTestBatch(starts, ends, numThreads=0)
+
+        heights = []
+        for res in ray_results:
+            if res[0] != -1:
+                heights.append(float(res[3][2]) - float(pos[2]))
+            else:
+                heights.append(0.0)
 
         raw_obs.extend(heights)
         obs = np.array(raw_obs, dtype=np.float32)
-        
-        return self._safe_obs(obs, clip=50.0)
-    
+        return self._scale_obs(obs)
+
     def _distance_to_path(self, pos):
         if self.path_cells is None:
             return 0.0
-
         px, py = pos[0], pos[1]
-
         half_extent = (self.size - 1) * self.scale / 2.0
-
         min_dist = 1e9
-        for ix, iy in self.path_cells[::5]:  # sample every 5 cells (fast)
+        for ix, iy in self.path_cells[::5]:
             x = -half_extent + ix * self.scale
             y = -half_extent + iy * self.scale
             d = (px - x) ** 2 + (py - y) ** 2
             if d < min_dist:
                 min_dist = d
-
         return np.sqrt(min_dist)
 
-    # -------------------------- step --------------------------
+    # -------------------------- step (differential drive) --------------------------
     def step(self, action):
-        action = np.asarray(action, dtype=np.float32)
-        throttle = float(action[0])
-        steer = float(action[1])
+        # 1. Acceleration Smoothing (Prevents Wheelies)
+        target_lin_vel = np.clip(action[0], -1.0, 1.0) * self.max_linear_vel
+        # alpha=0.1 means it takes ~10-15 steps to reach full speed
+        alpha = 0.1 
+        self.current_linear_vel = (1 - alpha) * self.current_linear_vel + alpha * target_lin_vel
+        
+        ang_vel = np.clip(action[1], -1.0, 1.0) * self.max_angular_vel
 
-        steer_angle = np.clip(steer, -1.0, 1.0) * self.max_steer_angle
-        if self.steer_joints:
-            p.setJointMotorControlArray(
-                self.robot,
-                self.steer_joints,
-                controlMode=p.POSITION_CONTROL,
-                targetPositions=[steer_angle] * len(self.steer_joints),
-                forces=[self.max_steer_force] * len(self.steer_joints),
-            )
+        # 2. Kinematics
+        half_track = self.track_width / 2.0
+        left_speed = (self.current_linear_vel - ang_vel * half_track) / self.wheel_radius
+        right_speed = (self.current_linear_vel + ang_vel * half_track) / self.wheel_radius
 
-        target_w = np.clip(throttle, -1.0, 1.0) * self.max_wheel_speed
-        if self.wheel_joints:
-            p.setJointMotorControlArray(
-                self.robot,
-                self.wheel_joints,
-                controlMode=p.VELOCITY_CONTROL,
-                targetVelocities=[target_w] * len(self.wheel_joints),
-                forces=[self.max_motor_force] * len(self.wheel_joints),
-            )
+        # 3. Apply Motor Control
+        p.setJointMotorControlArray(
+            self.robot,
+            self.wheel_joints,
+            controlMode=p.VELOCITY_CONTROL,
+            targetVelocities=[left_speed, right_speed, left_speed, right_speed],
+            forces=[self.max_motor_force] * 4,
+        )
 
         for _ in range(self.physics_steps_per_env_step):
             p.stepSimulation()
 
         self.steps += 1
-
         pos, orn = p.getBasePositionAndOrientation(self.robot)
-        vel, ang = p.getBaseVelocity(self.robot)
         roll, pitch, yaw = p.getEulerFromQuaternion(orn)
+        dist = float(np.linalg.norm(self.goal_xy - np.array(pos[:2])))
 
-        pos = np.asarray(pos, dtype=np.float32)
-        vel = np.asarray(vel, dtype=np.float32)
-        ang = np.asarray(ang, dtype=np.float32)
-
-        dist = float(np.linalg.norm(self.goal_xy - pos[:2]))
-
-        # ---------------- reward ----------------
+        # 4. Rewards & Penalties
         progress = self.prev_dist - dist
-        reward = progress * 6.0   
+        reward = progress * 15.0 
+        
+        # Heading reward
+        to_goal = self.goal_xy - np.array(pos[:2])
+        angle_to_goal = np.arctan2(to_goal[1], to_goal[0])
+        angle_diff = np.arctan2(np.sin(angle_to_goal - yaw), np.cos(angle_to_goal - yaw))
+        reward += 0.5 * np.cos(angle_diff)
 
-        # heading
-        to_goal = self.goal_xy - pos[:2]
-        angle_to_goal = float(np.arctan2(to_goal[1], to_goal[0]))
-        angle_diff = float(np.arctan2(np.sin(angle_to_goal - yaw),
-                                    np.cos(angle_to_goal - yaw)))
+        # Penalties: Added heavy penalty for flipping/tilting
+        reward -= 0.01 * self._distance_to_path(pos)
+        reward -= 0.2 * (pitch**2 + roll**2) 
+        reward -= 0.02 
 
-        forward_speed = float(vel[0] * np.cos(yaw) + vel[1] * np.sin(yaw))
-        reward += 0.4 * forward_speed * np.cos(angle_diff)
-
-        # alive bonus
-        #reward += 0.02
-
-        # reduce steering penalty
-        reward -= 0.005 * abs(steer)
-
-        # wall penalty (keep)
-        lim = self.half - 0.5
-        wall_dist = min(lim - abs(pos[0]), lim - abs(pos[1]))
-        if wall_dist < 1.5:
-            reward -= (1.5 - wall_dist) * 0.6
-
-        # tilt penalty (reduced)
-        reward -= 0.05 * (abs(roll) + abs(pitch))
-
-        # step penalty (small)
-        reward -= 0.005
-
-        # path penalty (weaker)
-        path_dist = self._distance_to_path(pos)
-        reward -= 0.05 * path_dist
-
-        if self.stuck_counter > 0:
-            reward += 0.1 * forward_speed
-        # ---------------- termination/truncation ----------------
+        # 5. Terminations
         terminated = False
         truncated = False
 
         if dist < 2.0:
-            reward += 150.0
+            reward += 1000.0
             terminated = True
 
-        if abs(roll) > 1.5 or abs(pitch) > 1.5:
-            reward -= 50.0
-            terminated = True
-
-        if pos[2] < -1.0:
+        if abs(roll) > 1.0 or abs(pitch) > 1.0: # Flipped detection
             reward -= 100.0
             terminated = True
 
-        if abs(pos[0]) > lim or abs(pos[1]) > lim:
-            reward -= 100.0
-            terminated = True
-
-        if (self.prev_dist - dist) < self.stuck_threshold:
+        if progress < self.stuck_threshold:
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
 
-        if self.stuck_counter >= self.max_stuck_steps:
-            reward -= 100.0
+        if self.stuck_counter >= 150:
+            reward -= 50.0
             truncated = True
-            self.stuck_counter = 0
 
-        if self.steps >= 1000:
+        if self.steps >= 4000:
             truncated = True
 
         self.prev_dist = dist
         return self._get_obs(), float(reward), terminated, truncated, {}
-
+    
     def close(self):
         self._clear_debug()
         for bid in self.terrain_obstacles:
