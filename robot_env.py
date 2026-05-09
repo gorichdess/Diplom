@@ -78,13 +78,13 @@ class RobotEnv(gym.Env):
         self.max_stuck_steps = 300   # consider reducing for Husky if needed
 
         # Husky control limits (differential drive)
-        self.max_linear_vel = 1.4    # m/s
+        self.max_linear_vel = 1.6    # m/s
         self.max_angular_vel = 1.0   # rad/s
         self.wheel_radius = 0.15     # approximate (meters)
         self.track_width = 0.6       # distance between left/right wheels (m)
 
         # Motor force (enough to drive on slopes)
-        self.max_motor_force = 150.0  # per wheel, value tuned for Husky mass
+        self.max_motor_force = 170.0  # per wheel, value tuned for Husky mass
         self.current_linear_vel = 0.0
 
         # Wheel joint indices for Husky (URDF)
@@ -383,6 +383,10 @@ class RobotEnv(gym.Env):
 
             z = clamp_slope_iter(z, max_dz_per_cell=clamp_limit, passes=2)
 
+            # FINAL guaranteed flat spawn/goal zones
+            z[0:self.flat_size, 0:self.flat_size] = self.flat_h
+            z[-self.flat_size:, -self.flat_size:] = self.flat_h
+
             self.heightmap = z.astype(np.float32)
             self.path_cells = path
 
@@ -394,7 +398,7 @@ class RobotEnv(gym.Env):
                 numHeightfieldColumns=size,
             )
             self.terrain_id = p.createMultiBody(0, shape)
-            p.changeDynamics(self.terrain_id, -1, lateralFriction=1.6, restitution=0.0)
+            p.changeDynamics(self.terrain_id, -1, lateralFriction=1.1, restitution=0.0)
             p.setPhysicsEngineParameter(enableConeFriction=1)
 
             placed = []
@@ -484,7 +488,7 @@ class RobotEnv(gym.Env):
             numHeightfieldColumns=size,
         )
         self.terrain_id = p.createMultiBody(0, shape)
-        p.changeDynamics(self.terrain_id, -1, lateralFriction=1.6, restitution=0.0)
+        p.changeDynamics(self.terrain_id, -1, lateralFriction=1.1, restitution=0.0)
         p.setPhysicsEngineParameter(enableConeFriction=1)
         return self.terrain_id
 
@@ -537,7 +541,8 @@ class RobotEnv(gym.Env):
         self._create_walls()
         self._create_goal()
 
-        spawn_z = self.flat_h + 0.35
+        spawn_z = self._get_terrain_height(self.start_xy[0], self.start_xy[1]) + 0.5
+
         yaw = float(np.arctan2(
             self.goal_xy[1] - self.start_xy[1],
             self.goal_xy[0] - self.start_xy[0]))
@@ -548,6 +553,10 @@ class RobotEnv(gym.Env):
             baseOrientation=p.getQuaternionFromEuler([0.0, 0.0, yaw]),
             flags=p.URDF_USE_INERTIA_FROM_FILE,
         )
+        
+
+        p.changeDynamics(self.robot, -1, collisionMargin=0.03)
+        
 
         # --- FIX FOR STABILITY & ERRORS ---
         num_joints = p.getNumJoints(self.robot)
@@ -575,8 +584,22 @@ class RobotEnv(gym.Env):
         self.current_linear_vel = 0.0 # NEW: for smoothing acceleration
         self.prev_dist = float(np.linalg.norm(self.goal_xy - self.start_xy))
 
+        for wheel in self.wheel_joints:
+                    p.changeDynamics(
+                        self.robot,
+                        wheel,
+                        lateralFriction=1.4,
+                        rollingFriction=0.02,
+                        spinningFriction=0.01,
+                        contactStiffness=4000.0,
+                        contactDamping=150.0,
+                    )
+
         for _ in range(80):
             p.stepSimulation()
+
+        # Let robot fully settle before episode starts
+        self.steps = -15
 
         if self.render:
             p.resetDebugVisualizerCamera(
@@ -648,6 +671,14 @@ class RobotEnv(gym.Env):
 
     # -------------------------- step (differential drive) --------------------------
     def step(self, action):
+
+        # Initial stabilization frames
+        if self.steps < 0:
+            for _ in range(self.physics_steps_per_env_step):
+                p.stepSimulation()
+
+            self.steps += 1
+            return self._get_obs(), 0.0, False, False, {}
         # 1. Acceleration Smoothing (Prevents Wheelies)
         target_lin_vel = np.clip(action[0], -1.0, 1.0) * self.max_linear_vel
         # alpha=0.1 means it takes ~10-15 steps to reach full speed
@@ -678,28 +709,45 @@ class RobotEnv(gym.Env):
         roll, pitch, yaw = p.getEulerFromQuaternion(orn)
         dist = float(np.linalg.norm(self.goal_xy - np.array(pos[:2])))
 
+        # ------------------------------------------------------------
         # 4. Rewards & Penalties
+        # ------------------------------------------------------------
+
         progress = self.prev_dist - dist
-        reward = progress * 15.0 
-        
+        reward = progress * 5.0
+
         # Heading reward
         to_goal = self.goal_xy - np.array(pos[:2])
         angle_to_goal = np.arctan2(to_goal[1], to_goal[0])
-        angle_diff = np.arctan2(np.sin(angle_to_goal - yaw), np.cos(angle_to_goal - yaw))
+        angle_diff = np.arctan2(
+            np.sin(angle_to_goal - yaw),
+            np.cos(angle_to_goal - yaw)
+        )
+
         reward += 0.5 * np.cos(angle_diff)
 
-        # Penalties: Added heavy penalty for flipping/tilting
+        # Stay near path
         reward -= 0.01 * self._distance_to_path(pos)
-        reward -= 0.2 * (pitch**2 + roll**2) 
-        reward -= 0.02 
+
+        # Tilt penalty
+        reward -= 0.2 * (pitch**2 + roll**2)
+
+        # Penalize bouncing / jumping
+        vel, ang_vel = p.getBaseVelocity(self.robot)
+        reward -= 0.2 * abs(vel[2])
+
+        # Small time penalty
+        reward -= 0.07
 
         # 5. Terminations
         terminated = False
         truncated = False
 
-        if dist < 2.0:
-            reward += 1000.0
+        reach_goal = False
+        if dist < 3.0:
+            reward += 700.0
             terminated = True
+            reach_goal = True
 
         if abs(roll) > 1.0 or abs(pitch) > 1.0: # Flipped detection
             reward -= 100.0
@@ -710,15 +758,15 @@ class RobotEnv(gym.Env):
         else:
             self.stuck_counter = 0
 
-        if self.stuck_counter >= 150:
-            reward -= 50.0
+        if self.stuck_counter >= 100:
+            reward -= 100.0
             truncated = True
 
-        if self.steps >= 4000:
+        if self.steps >= 2000:
             truncated = True
 
         self.prev_dist = dist
-        return self._get_obs(), float(reward), terminated, truncated, {}
+        return self._get_obs(), float(reward), terminated, truncated, {"reach_goal": reach_goal}
     
     def close(self):
         self._clear_debug()

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-import numpy as np   # for np.log(2.) in the correction
+import numpy as np
 
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 1.0
@@ -33,7 +33,6 @@ class ActorCritic(nn.Module):
             layer_init(nn.Linear(512, 1)),
         )
 
-        # Learnable log_std (one per action dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, x):
@@ -59,42 +58,34 @@ class ActorCritic(nn.Module):
         dist = self._dist(mu)
 
         if deterministic:
-            raw_action = mu  
+            raw_action = mu                       # mean action
             action = torch.tanh(mu)
         else:
-            raw_action = dist.rsample()                # unbounded sample
-            action = torch.tanh(raw_action)            # squashed to [-1, 1]
+            raw_action = dist.rsample()           # unbounded sample
+            action = torch.tanh(raw_action)
 
-        # Log‑prob using the change‑of‑variables formula
-        # log_prob = dist.log_prob(raw_action) - sum(log(1 - tanh(raw_action)^2) + EPS)
-        # where the second term is: 2 * (log(2) - raw_action - softplus(-2*raw_action))
+        # log‑prob using the same correction as in evaluate()
         log_prob = dist.log_prob(raw_action).sum(-1)
         correction = (2.0 * (np.log(2.0) - raw_action - F.softplus(-2.0 * raw_action))).sum(-1)
         log_prob = log_prob - correction
 
         log_prob = torch.nan_to_num(log_prob, nan=-20.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
 
-        # Return squashed action (not raw)
-        return action.detach().cpu().numpy()[0], float(value.item()), float(log_prob.item())
+        # Return squashed action for the environment, plus raw_action for storage
+        return action.detach().cpu().numpy()[0], float(value.item()), float(log_prob.item()), raw_action.detach().cpu().numpy()[0]
 
-    def evaluate(self, obs, action):
-        # Sanitize observation
+    def evaluate(self, obs, raw_action):
+        """
+        obs:       observation tensor
+        raw_action: the original pre‑tanh action (same as stored from get_action)
+        """
         obs = torch.nan_to_num(obs, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-
         mu, value = self.forward(obs)
         dist = self._dist(mu)
 
-        # Stability epsilon: prevents the log(0) issue at the boundaries of tanh
-        eps = 1e-5 
-        action_clamped = torch.clamp(action, -1.0 + eps, 1.0 - eps)
-        
-        # Recover raw Gaussian action for log_prob calculation
-        raw_action = 0.5 * (torch.log(1.0 + action_clamped) - torch.log(1.0 - action_clamped))
-
-        # Log-prob with the tanh squashing correction
+        # Log‑prob of the raw action (no inversion, no boundary issues)
         log_prob = dist.log_prob(raw_action).sum(-1)
-        # This is the change of variables correction: log(1 - tanh^2(x))
-        correction = torch.sum(torch.log(1.0 - action_clamped**2 + 1e-6), dim=-1)
+        correction = (2.0 * (np.log(2.0) - raw_action - F.softplus(-2.0 * raw_action))).sum(-1)
         log_prob = log_prob - correction
 
         entropy = dist.entropy().sum(-1)

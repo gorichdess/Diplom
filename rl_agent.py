@@ -10,12 +10,14 @@ class PPOAgent:
         self.clip = 0.2
 
         self.lr = 1e-4
-        self.epochs = 10
-        self.batch_size = 512
+        self.epochs = 8                 # reduced from 10
+        self.batch_size = 1024          # increased from 512
 
         self.entropy_coef = 0.05
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
+
+        self.reward_scale = 0.01        # new: scale all environment rewards
 
         self.ac = ActorCritic(obs_dim, action_dim)
         self.optimizer = optim.Adam(self.ac.parameters(), lr=self.lr)
@@ -23,12 +25,12 @@ class PPOAgent:
         self.memory = []
 
     def store(self, transition):
-        # transition: (state, action, logp, reward, done, value)
+        # transition: (state, raw_action, logp, reward, done, value)
         self.memory.append(transition)
 
     def set_entropy_coef(self, coef):
         self.entropy_coef = float(coef)
-        
+
     def set_lr(self, lr):
         self.lr = float(lr)
         for param_group in self.optimizer.param_groups:
@@ -48,44 +50,46 @@ class PPOAgent:
         if len(self.memory) == 0:
             return 0.0
 
-        # ---- unpack
-        states = torch.tensor(np.array([m[0] for m in self.memory]), dtype=torch.float32)
-        actions = torch.tensor(np.array([m[1] for m in self.memory]), dtype=torch.float32)
-        old_logp = torch.tensor(np.array([m[2] for m in self.memory]), dtype=torch.float32).detach()
+        # ---- unpack ----
+        states  = torch.tensor(np.array([m[0] for m in self.memory]), dtype=torch.float32)
+        actions = torch.tensor(np.array([m[1] for m in self.memory]), dtype=torch.float32)  # raw actions
+        old_logp= torch.tensor(np.array([m[2] for m in self.memory]), dtype=torch.float32).detach()
 
-        rewards = np.array([m[3] for m in self.memory], dtype=np.float32)
-        dones = np.array([m[4] for m in self.memory], dtype=np.float32)
-        values = np.array([m[5] for m in self.memory], dtype=np.float32)
+        rewards = np.array([m[3] for m in self.memory], dtype=np.float32) * self.reward_scale
+        dones   = np.array([m[4] for m in self.memory], dtype=np.float32)
+        values  = np.array([m[5] for m in self.memory], dtype=np.float32) * self.reward_scale  # also scale value estimates
 
-        # ---- safety (removed action clipping since they are now unbounded standard normals)
-        states = torch.nan_to_num(states, nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
-        actions = torch.nan_to_num(actions, nan=0.0, posinf=10.0, neginf=-10.0) 
+        # safety
+        states   = torch.nan_to_num(states,   nan=0.0, posinf=50.0, neginf=-50.0).clamp(-50.0, 50.0)
+        actions  = torch.nan_to_num(actions,  nan=0.0, posinf=10.0, neginf=-10.0)
         old_logp = torch.nan_to_num(old_logp, nan=-20.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
 
-        # ---- GAE with BOOTSTRAP
-        values_ext = np.append(values, float(last_value))
-        returns = np.zeros_like(rewards, dtype=np.float32)
+        # ---- GAE ----
+        values_ext = np.append(values, float(last_value) * self.reward_scale)
+        returns    = np.zeros_like(rewards, dtype=np.float32)
         advantages = np.zeros_like(rewards, dtype=np.float32)
 
         gae = 0.0
         for t in reversed(range(len(rewards))):
-            delta = rewards[t] + self.gamma * values_ext[t + 1] * (1.0 - dones[t]) - values_ext[t]
+            delta = rewards[t] + self.gamma * values_ext[t+1] * (1.0 - dones[t]) - values_ext[t]
             gae = delta + self.gamma * self.lam * (1.0 - dones[t]) * gae
             advantages[t] = gae
-            returns[t] = gae + values_ext[t]
+            returns[t]    = gae + values_ext[t]
 
         returns = torch.tensor(returns, dtype=torch.float32)
         values_t = torch.tensor(values, dtype=torch.float32)
 
         # normalize advantages
-        advantages = returns - values_t
-        adv_std = advantages.std()
+        advantages_t = returns - values_t
+        adv_std = advantages_t.std()
         if torch.isfinite(adv_std) and adv_std > 1e-6:
-            advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+            advantages_t = (advantages_t - advantages_t.mean()) / (adv_std + 1e-8)
         else:
-            advantages = advantages - advantages.mean()
-        advantages = torch.nan_to_num(advantages, nan=0.0).clamp(-5.0, 5.0)
-        returns = torch.nan_to_num(returns, nan=0.0)
+            advantages_t = advantages_t - advantages_t.mean()
+        advantages_t = torch.nan_to_num(advantages_t, nan=0.0).clamp(-5.0, 5.0)
+
+        # clamp returns for value loss stability
+        returns = torch.clamp(returns, -10.0, 10.0)
 
         n = states.shape[0]
         idx = torch.arange(n)
@@ -96,20 +100,21 @@ class PPOAgent:
         for _ in range(self.epochs):
             perm = idx[torch.randperm(n)]
             for start in range(0, n, self.batch_size):
-                mb = perm[start:start + self.batch_size]
+                mb = perm[start:start+self.batch_size]
 
                 s = states[mb]
-                a = actions[mb]
+                a = actions[mb]          # raw action
                 oldlp = old_logp[mb]
                 ret = returns[mb]
-                adv = advantages[mb]
+                adv = advantages_t[mb]
                 v_old = values_t[mb]
 
+                # evaluate now expects raw action
                 new_logp, v_pred, entropy = self.ac.evaluate(s, a)
 
                 new_logp = torch.nan_to_num(new_logp, nan=-20.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-                v_pred = torch.nan_to_num(v_pred, nan=0.0)
-                entropy = torch.nan_to_num(entropy, nan=0.0)
+                v_pred   = torch.nan_to_num(v_pred,   nan=0.0)
+                entropy  = torch.nan_to_num(entropy,  nan=0.0)
 
                 # PPO ratio
                 ratio = torch.exp(torch.clamp(new_logp - oldlp, -10, 10))

@@ -2,7 +2,7 @@ EVALUATION SUMMARY
 ==================
 Difficulty:      0.65
 Total Episodes:  100
-Success Rate:    24.0%
-Average Reward:  793.66
-Average Steps:   555.1
-Best Reward:     2154.03 (Episode 29)
+Success Rate:    17.0%
+Average Reward:  295.35
+Average Steps:   561.4
+Best Reward:     1229.70 (Episode 13)

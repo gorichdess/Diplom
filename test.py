@@ -9,13 +9,13 @@ def test():
     # 1. Initialize Environment
     # You can change the difficulty here (e.g., 0.1 for easy, 0.8 for hard)
     # Default is 0.3 if not specified
-    target_difficulty = 1.0
+    target_difficulty = 0.6
     env = RobotEnv(render=True, difficulty=target_difficulty)
     
     # 2. Load Model
     model = ActorCritic(env.obs_dim, 2)
     try:
-        model.load_state_dict(torch.load("upds/best_model.pth", map_location="cpu"))
+        model.load_state_dict(torch.load("upds/checkpoint_upd_380.pth", map_location="cpu"))
         print(f"Successfully loaded best_model.pth")
     except FileNotFoundError:
         print("Warning: best_model.pth not found. Testing with random weights.")
@@ -45,13 +45,13 @@ def test():
     print("Starting simulation...")
     while not done:
         with torch.no_grad():
-            # deterministic=True ensures we see the best guess, not exploration
-            action, _, _ = model.get_action(state, deterministic=True)
-            
-        state, reward, term, trunc, _ = env.step(action)
+            # deterministic=True returns (squashed_action, value, logp, raw_action)
+            squashed_action, *_ = model.get_action(state, deterministic=True)
+
+        state, reward, term, trunc, _ = env.step(squashed_action)
         total_reward += reward
         done = term or trunc
-        
+
         # Keep the simulation at a watchable speed
         time.sleep(1/60)
 

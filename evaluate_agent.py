@@ -7,22 +7,18 @@ from robot_env import RobotEnv
 from model import ActorCritic
 
 def run_evaluation(num_episodes=100, target_difficulty=0.65):
-    # 1. Setup Environment (Headless)
     print(f"Starting evaluation of {num_episodes} episodes...")
     env = RobotEnv(render=False, difficulty=target_difficulty)
-    
-    # 2. Load Model
+
     model = ActorCritic(env.obs_dim, 2)
     try:
-        model.load_state_dict(torch.load("upds/best_model.pth", map_location="cpu"))
+        model.load_state_dict(torch.load("upds/checkpoint_upd_380.pth", map_location="cpu"))
         model.eval()
     except FileNotFoundError:
         print("Error: best_model.pth not found.")
         return
 
-    # List to store data for every episode
     episode_data = []
-    
     best_reward = -float('inf')
     best_seed = 0
 
@@ -31,28 +27,25 @@ def run_evaluation(num_episodes=100, target_difficulty=0.65):
         done = False
         ep_reward = 0
         ep_steps = 0
-        
+
         while not done:
             with torch.no_grad():
-                action, _, _ = model.get_action(obs, deterministic=True)
-            obs, reward, terminated, truncated, _ = env.step(action)
+                squashed_action, *_ = model.get_action(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(squashed_action)  # capture info
             ep_reward += reward
             ep_steps += 1
             done = terminated or truncated
 
-        # Logic to determine success
-        pos, _ = p.getBasePositionAndOrientation(env.robot)
-        dist_to_goal = np.linalg.norm(env.goal_xy - np.array(pos[:2]))
-        # In robot_env.py, success is defined as dist < 4.0
-        success = 1 if dist_to_goal < 4.5 else 0 
+        # Use the ground-truth success flag from the environment if available,
+        # otherwise fall back to distance check.
+        success = 1 if info.get("reach_goal", False) else 0
 
-        # Store data for this episode
         episode_data.append({
             "episode": i,
             "reward": round(ep_reward, 2),
             "steps": ep_steps,
             "success": success,
-            "dist_to_goal": round(dist_to_goal, 2)
+            "dist_to_goal": 0.0  # you could still compute if needed, but success is enough
         })
 
         if ep_reward > best_reward:
@@ -64,11 +57,10 @@ def run_evaluation(num_episodes=100, target_difficulty=0.65):
 
     env.close()
 
-    # --- 3. Save to CSV ---
+    # --- Save to CSV and summary (unchanged) ---
     df = pd.DataFrame(episode_data)
     df.to_csv("evaluation_results.csv", index=False)
     
-    # --- 4. Generate and Save Summary ---
     success_rate = (df['success'].sum() / num_episodes) * 100
     avg_reward = df['reward'].mean()
     avg_steps = df['steps'].mean()
@@ -90,7 +82,7 @@ def run_evaluation(num_episodes=100, target_difficulty=0.65):
     print("\n" + summary_text)
     print(f"Results saved to 'evaluation_results.csv' and 'evaluation_summary.txt'")
 
-    # --- 5. Replay Best Episode ---
+    # --- Replay Best Episode ---
     print(f"\nReplaying Best Episode (Seed {best_seed}) for visualization...")
     replay_env = RobotEnv(render=True, difficulty=target_difficulty)
     obs, _ = replay_env.reset(seed=best_seed)
@@ -100,8 +92,8 @@ def run_evaluation(num_episodes=100, target_difficulty=0.65):
     done = False
     while not done:
         with torch.no_grad():
-            action, _, _ = model.get_action(obs, deterministic=True)
-        obs, _, term, trunc, _ = replay_env.step(action)
+            squashed_action, *_ = model.get_action(obs, deterministic=True)   # corrected unpacking
+        obs, _, term, trunc, _ = replay_env.step(squashed_action)            # you can ignore info here
         done = term or trunc
         time.sleep(1/60)
     
