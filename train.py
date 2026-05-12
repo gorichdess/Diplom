@@ -17,7 +17,7 @@ def setup_logger():
     )
 
 def evaluate_policy(agent, env_eval, eval_episodes=3):
-    """Evaluate the agent deterministically without exploring noise."""
+    """Evaluate the agent deterministically (no exploration noise)."""
     avg_reward = 0.0
     for _ in range(eval_episodes):
         obs, _ = env_eval.reset()
@@ -32,15 +32,24 @@ def evaluate_policy(agent, env_eval, eval_episodes=3):
         avg_reward += ep_ret
     return avg_reward / eval_episodes
 
+def get_target_success(difficulty: float) -> float:
+    """Return the success rate needed to increase difficulty."""
+    # linear: at diff=0 -> 0.8, diff=1.0 -> 0.3
+    target = 0.8 - 0.5 * difficulty
+    # clamp between 0.2 and 0.8
+    return max(0.2, min(0.8, target))
+
 
 def train():
     setup_logger()
 
-    # -------- Curriculum --------
+    # -------- Curriculum settings --------
     difficulty = 0.0
     max_difficulty = 1.0
     diff_step = 0.05
     diff_every_updates = 10
+    success_threshold = 0.8          # Increase only when ≥80% success
+    success_lower_bound = 0.2      # Decrease if success drops below 40%
 
     # -------- PPO --------
     rollout_steps = 4096
@@ -49,7 +58,7 @@ def train():
     # -------- Env / Agent --------
     env = RobotEnv(render=False, difficulty=difficulty, draw_path=False)
     env_eval = RobotEnv(render=False, difficulty=difficulty, draw_path=False)
-    
+
     agent = PPOAgent(env.obs_dim, env.action_space.shape[0])
 
     # -------- Tracking --------
@@ -60,8 +69,8 @@ def train():
 
     best_eval_reward = -1e9
     rewards_100 = deque(maxlen=100)
-    steps_100 = deque(maxlen=100) 
-    success_100 = deque(maxlen=100) 
+    steps_100 = deque(maxlen=100)
+    success_100 = deque(maxlen=100)
 
     updates = 0
     total_steps = 0
@@ -74,14 +83,10 @@ def train():
     while ep < num_of_ep:
         # ================= ROLLOUT =================
         for _ in range(rollout_steps):
-            # Changed: get_action now returns (squashed_action, value, logp, raw_action)
             squashed_action, value, logp, raw_action = agent.ac.get_action(obs, deterministic=False)
-
-            # Environment receives squashed action
             next_obs, reward, terminated, truncated, info = env.step(squashed_action)
             done = terminated or truncated
 
-            # Store raw_action (not squashed) for consistent log-prob computation
             agent.store((obs, raw_action, logp, reward, float(done), value))
 
             obs = next_obs
@@ -92,7 +97,7 @@ def train():
             if done:
                 rewards_100.append(ep_reward)
                 steps_100.append(ep_steps)
-                success_100.append(1 if info.get("reach_goal", False) else 0)   # NEW
+                success_100.append(1 if info.get("reach_goal", False) else 0)
                 print(f"EP {ep:05d} | Reward {ep_reward:8.2f} | Steps {ep_steps}")
                 ep += 1
                 ep_steps = 0
@@ -108,12 +113,12 @@ def train():
         if updates % 5 == 0:
             eval_reward = evaluate_policy(agent, env_eval, eval_episodes=3)
             print(f"--- Eval Reward: {eval_reward:.2f} ---")
-            
+
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
                 torch.save(agent.ac.state_dict(), "upds/best_model.pth")
                 print(f"Saved BEST model: {best_eval_reward:.2f}")
-                
+
         if updates % 10 == 0:
             torch.save(agent.ac.state_dict(), f"upds/checkpoint_upd_{updates}.pth")
 
@@ -131,8 +136,8 @@ def train():
             f"UPD {updates:04d} | "
             f"EP {ep:05d} | "
             f"Avg100 {avg100:8.2f} | "
-            f"AvgSteps {avg_steps:7.1f} | " 
-            f"Succ {succ_rate:.1f}% | "   
+            f"AvgSteps {avg_steps:7.1f} | "
+            f"Succ {succ_rate:.1f}% | "
             f"Loss {loss:8.4f} | "
             f"Diff {difficulty:4.2f} | "
             f"Ent {agent.entropy_coef:6.4f} | "
@@ -145,9 +150,8 @@ def train():
             logging.info(log_line)
 
         # ================= HYPERPARAMETER DECAY =================
-        agent.entropy_coef = max(0.005, agent.entropy_coef * 0.9998)
-        
-        # Linear learning rate decay
+        agent.entropy_coef = max(0.005, agent.entropy_coef * 0.999)
+
         frac = 1.0 - (ep / float(num_of_ep))
         new_lr = max(0.0, initial_lr * frac)
         agent.set_lr(new_lr)
@@ -155,22 +159,35 @@ def train():
         # ================= CURRICULUM =================
         if (
             updates % diff_every_updates == 0
-            and len(rewards_100) == rewards_100.maxlen
-            and len(success_100) == success_100.maxlen                # buffer must be full
-            and (sum(success_100) / len(success_100)) >= 0.5          # ≥50% success
+            and len(rewards_100) == rewards_100.maxlen   # buffer full
+            and len(success_100) == success_100.maxlen
         ):
-            if difficulty < max_difficulty:
+            current_success = sum(success_100) / len(success_100)
+            target_success = get_target_success(difficulty)
+
+            # Increase difficulty
+            if current_success >= target_success and difficulty < max_difficulty:
                 difficulty = min(max_difficulty, difficulty + diff_step)
-
-                env.close()
-                env = RobotEnv(render=False, difficulty=difficulty, draw_path=False)
-                
-                env_eval.close()
-                env_eval = RobotEnv(render=False, difficulty=difficulty, draw_path=False)
-                
+                env.set_difficulty(difficulty)
+                env_eval.set_difficulty(difficulty)
                 obs, _ = env.reset()
+                success_100.clear()
+                rewards_100.clear()
+                steps_100.clear()
+                msg = f"Difficulty increased to {difficulty:.2f} (target {target_success*100:.1f}%, actual {current_success*100:.1f}%)"
+                print(msg)
+                logging.info(msg)
 
-                msg = f"Difficulty increased to {difficulty:.2f}"
+            # Decrease difficulty if performance collapses (still at fixed 20%)
+            elif current_success <= success_lower_bound and difficulty > 0.0:
+                difficulty = max(0.0, difficulty - diff_step)
+                env.set_difficulty(difficulty)
+                env_eval.set_difficulty(difficulty)
+                obs, _ = env.reset()
+                success_100.clear()
+                rewards_100.clear()
+                steps_100.clear()
+                msg = f"Difficulty decreased to {difficulty:.2f} (success {current_success*100:.1f}%)"
                 print(msg)
                 logging.info(msg)
 

@@ -6,13 +6,13 @@ import pandas as pd
 from robot_env import RobotEnv
 from model import ActorCritic
 
-def run_evaluation(num_episodes=100, target_difficulty=0.65):
+def run_evaluation(num_episodes=100, target_difficulty=0.3):
     print(f"Starting evaluation of {num_episodes} episodes...")
     env = RobotEnv(render=False, difficulty=target_difficulty)
 
     model = ActorCritic(env.obs_dim, 2)
     try:
-        model.load_state_dict(torch.load("upds/checkpoint_upd_380.pth", map_location="cpu"))
+        model.load_state_dict(torch.load("upds/best_model.pth", map_location="cpu"))
         model.eval()
     except FileNotFoundError:
         print("Error: best_model.pth not found.")

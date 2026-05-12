@@ -9,13 +9,13 @@ def test():
     # 1. Initialize Environment
     # You can change the difficulty here (e.g., 0.1 for easy, 0.8 for hard)
     # Default is 0.3 if not specified
-    target_difficulty = 0.6
+    target_difficulty = 0.5
     env = RobotEnv(render=True, difficulty=target_difficulty)
     
     # 2. Load Model
     model = ActorCritic(env.obs_dim, 2)
     try:
-        model.load_state_dict(torch.load("upds/checkpoint_upd_380.pth", map_location="cpu"))
+        model.load_state_dict(torch.load("upds/checkpoint_upd_1080.pth", map_location="cpu"))
         print(f"Successfully loaded best_model.pth")
     except FileNotFoundError:
         print("Warning: best_model.pth not found. Testing with random weights.")

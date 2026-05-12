@@ -7,17 +7,17 @@ class PPOAgent:
     def __init__(self, obs_dim, action_dim):
         self.gamma = 0.99
         self.lam = 0.95
-        self.clip = 0.2
+        self.clip = 0.15
 
         self.lr = 1e-4
-        self.epochs = 8                 # reduced from 10
-        self.batch_size = 1024          # increased from 512
+        self.epochs = 12                
+        self.batch_size = 1024          
 
-        self.entropy_coef = 0.05
+        self.entropy_coef = 0.02
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
 
-        self.reward_scale = 0.01        # new: scale all environment rewards
+        self.reward_scale = 0.1        
 
         self.ac = ActorCritic(obs_dim, action_dim)
         self.optimizer = optim.Adam(self.ac.parameters(), lr=self.lr)
@@ -25,7 +25,6 @@ class PPOAgent:
         self.memory = []
 
     def store(self, transition):
-        # transition: (state, raw_action, logp, reward, done, value)
         self.memory.append(transition)
 
     def set_entropy_coef(self, coef):

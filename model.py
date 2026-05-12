@@ -88,6 +88,6 @@ class ActorCritic(nn.Module):
         correction = (2.0 * (np.log(2.0) - raw_action - F.softplus(-2.0 * raw_action))).sum(-1)
         log_prob = log_prob - correction
 
-        entropy = dist.entropy().sum(-1)
+        entropy = dist.entropy().sum(-1) - correction
 
         return log_prob, value.squeeze(-1), entropy
