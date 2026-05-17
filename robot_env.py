@@ -19,6 +19,9 @@ class RobotEnv(gym.Env):
     def __init__(self, render: bool = False, difficulty: float = 0.0, draw_path: bool = True):
         super().__init__()
         self.render = render
+
+        # Curriculum parameter controlling terrain complexity.
+        # 0.0 = flat terrain, 1.0 = highly irregular terrain.
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
         self.draw_path = bool(draw_path)
 
@@ -33,12 +36,20 @@ class RobotEnv(gym.Env):
 
         # Ray samples for terrain observation
         self.sample_offsets = []
+
+        # Multi-scale terrain sampling:
+        # near rays help with immediate obstacle avoidance,
+        # far rays provide long-range terrain awareness.
         for x in [0.2, 0.5, 1.5, 3.5, 6.0, 10.0]:
             y_spread = 0.5 if x < 1.0 else 1.5 if x < 5.0 else 2.5
             for y in np.linspace(-y_spread, y_spread, 5):
                 self.sample_offsets.append((x, float(y)))
         self.sample_offsets.append((0.0, 0.0))
 
+        # Observation vector:
+        # 14 robot/navigation features +
+        # terrain ray samples +
+        # current curriculum difficulty
         self.obs_dim = 14 + len(self.sample_offsets)+1
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
@@ -61,19 +72,22 @@ class RobotEnv(gym.Env):
                                   -half_extent + goal_idx * self.scale], dtype=np.float32)
 
         # Husky physics limits (differential drive)
-        self.max_linear_vel = 1.6   # m/s
+        self.max_linear_vel = 1.0   # m/s
         self.max_angular_vel = 1.0  # rad/s (used on harder difficulties)
         self.wheel_radius = 0.15
         self.track_width  = 0.6
-        self.max_motor_force = 500.0
-        self.wheel_joints = [2, 3, 4, 5]
+        self.max_motor_force = 650.0
+        self.wheel_joints = []
 
         # Smoothing of linear velocity (helps prevent wheelies)
         self.current_linear_vel = 0.0
-        self.alpha_smooth = 0.2   # higher = faster response, but still smooth
+
+        # Exponential smoothing coefficient for commanded velocity.
+        # Reduces abrupt acceleration and improves training stability.
+        self.alpha_smooth = 0.2   
 
         # Simulation steps per control step
-        self.physics_steps_per_env_step = 10
+        self.physics_steps_per_env_step = 20
 
         # Internal state
         self.robot = None
@@ -95,9 +109,9 @@ class RobotEnv(gym.Env):
         self.max_stuck_steps = 200      # only truncate after long stuck period
         self.slip_penalty = 0.0         # accumulated slip penalty
 
-    # ----------------------------------------------------------------------
-    # Utility / observation helpers
-    # ----------------------------------------------------------------------
+
+    # Prevent NaN/Inf values from entering the policy network,
+    # which can destabilize PPO training.
     def _safe_obs(self, obs, clip=50.0):
         obs = np.asarray(obs, dtype=np.float32)
         obs = np.nan_to_num(obs, nan=0.0, posinf=clip, neginf=-clip)
@@ -137,11 +151,9 @@ class RobotEnv(gym.Env):
         y1 = min(self.size, iy + patch_cells + 1)
         return float(np.max(self.heightmap[x0:x1, y0:y1]))
 
-    # ----------------------------------------------------------------------
-    # Terrain generation (curriculum‑aware)
-    # ----------------------------------------------------------------------
+
     def set_difficulty(self, new_difficulty):
-        """Change terrain difficulty and rebuild the world. Call reset afterwards."""
+        #Change terrain difficulty and rebuild the world. Call reset afterwards.
         self.difficulty = float(np.clip(new_difficulty, 0.0, 1.0))
         # Re‑generate terrain on next reset
         if self.terrain_id is not None:
@@ -160,7 +172,7 @@ class RobotEnv(gym.Env):
             p.removeBody(bid)
         self.terrain_obstacles = []
 
-        # ---- Flat world for difficulty < 0.05 ----
+        # Flat world for difficulty < 0.05
         if self.difficulty < 0.05:
             self.heightmap = np.full((self.size, self.size), self.flat_h, dtype=np.float32)
             self.path_cells = None
@@ -175,15 +187,18 @@ class RobotEnv(gym.Env):
             p.changeDynamics(self.terrain_id, -1, lateralFriction=1.1, restitution=0.0)
             return self.terrain_id
 
-        # ---- Procedural terrain for difficulty >= 0.05 ----
+        #Procedural terrain for difficulty >= 0.05
         diff = self.difficulty
         size = self.size
 
-        # Helper functions (unchanged)
+        # Normalize terrain noise to [0, 1] range
+        # before amplitude scaling.
         def normalize01(a):
             a = a - a.min()
             return a / (a.max() + 1e-8)
 
+        # Fractal Brownian Motion terrain synthesis using
+        # multiple Gaussian-filtered noise layers.  
         def fbm(shape, sigmas, weights):
             acc = np.zeros(shape, dtype=np.float32)
             for s, w in zip(sigmas, weights):
@@ -192,6 +207,8 @@ class RobotEnv(gym.Env):
                 acc += w * n
             return acc
 
+        # Add local Gaussian-shaped elevation features
+        # such as hills or pits.
         def stamp_gaussian(z, cx, cy, radius, amp):
             x0 = max(0, cx - radius)
             x1 = min(size, cx + radius + 1)
@@ -206,6 +223,8 @@ class RobotEnv(gym.Env):
             bump = np.exp(-0.5 * d2 / (sigma*sigma)).astype(np.float32)
             z[x0:x1, y0:y1] += amp * bump
 
+        # Iteratively limit local terrain slope to ensure
+        # traversability for the robot.
         def clamp_slope_iter(z, max_dz_per_cell, passes=4):
             zc = z.copy()
             for _ in range(passes):
@@ -225,6 +244,8 @@ class RobotEnv(gym.Env):
                 )
             return zc
 
+        # Compute traversable path through terrain using
+        # A* search with slope-aware traversal cost.
         def astar_path(z, start, goal, max_step):
             nbrs = [(-1,0), (1,0), (0,-1), (0,1),
                     (-1,-1), (-1,1), (1,-1), (1,1)]
@@ -262,7 +283,7 @@ class RobotEnv(gym.Env):
                     if dz > max_step:
                         continue
                     step_cost = np.sqrt(2) if (dx!=0 and dy!=0) else 1.0
-                    slope_pen = 1.0 + 8.0*(dz/(max_step+1e-6))**2
+                    slope_pen = 1.0 + 8.0*(dz/(max_step+1e-6))**2 # Penalize steep terrain transitions during path search.
                     ng = gc + step_cost * slope_pen
                     if ng < g[nx,ny]:
                         g[nx,ny] = ng
@@ -270,6 +291,8 @@ class RobotEnv(gym.Env):
                         heapq.heappush(pq, (ng+h(nx,ny), ng, nx, ny))
             return None
 
+        # Smooth and flatten a navigable corridor around
+        # the planned A* path while preserving some roughness.  
         def carve_corridor(z, path, width_cells, smooth_sigma, drop, keep_rough, berm):
             core = np.zeros((size,size), dtype=np.uint8)
             for x,y in path: core[x,y]=1
@@ -296,13 +319,13 @@ class RobotEnv(gym.Env):
         goal = (goal_idx, goal_idx)
         margin = self.flat_size + self.smooth_width + 4
 
-        # Parameters scale linearly with difficulty, but stay realistic at low values
-        max_step = 0.13 + 0.07*(1.0 - diff)        # 0.13 m if diff=1, 0.20 m if diff=0 → we cap at 0.18 for low diff
-        max_step = min(max_step, 0.18 + 0.02*diff)  # never easier than 0.18 m step
+        # Parameters scale linearly with difficulty
+        max_step = 0.13 + 0.07*(1.0 - diff)        
+        max_step = min(max_step, 0.18 + 0.02*diff)  
         clamp_limit = max_step * 1.1
 
         for _attempt in range(50):
-            macro_amp = 0.2 + 1.1*diff   # starts low
+            macro_amp = 0.2 + 1.1*diff   
             mid_amp   = 0.15 + 0.5*diff
             macro = fbm((size,size), sigmas=[22,14], weights=[1,0.55])
             mid   = fbm((size,size), sigmas=[9,5], weights=[0.9,0.55])
@@ -332,16 +355,26 @@ class RobotEnv(gym.Env):
             z = clamp_slope_iter(z, max_dz_per_cell=clamp_limit, passes=4)
 
             # Ensure flat spawn/goal patches
-            platform = self.flat_size + 6
-            z[0:platform, 0:platform] = self.flat_h
-            z[-platform:, -platform:] = self.flat_h
-            # smooth transition around spawn
-            z[0:platform+6, 0:platform+6] = scipy.ndimage.gaussian_filter(
-                z[0:platform+6, 0:platform+6], sigma=2.5)
-            z[0:platform, 0:platform] = self.flat_h
-            z[-(platform+6):, -(platform+6):] = scipy.ndimage.gaussian_filter(
-                z[-(platform+6):, -(platform+6):], sigma=2.5)
-            z[-platform:, -platform:] = self.flat_h
+            half = self.size / 2.0
+            radius_inner = self.flat_size / 2.0
+            radius_outer = radius_inner + self.smooth_width + 3
+
+            yg, xg = np.mgrid[0:self.size, 0:self.size]
+            dist_start = np.sqrt(xg**2 + yg**2)
+            dist_goal  = np.sqrt((xg - (self.size-1))**2 + (yg - (self.size-1))**2)
+
+            mask_start = np.clip((dist_start - radius_inner) / (radius_outer - radius_inner), 0.0, 1.0)
+            mask_goal  = np.clip((dist_goal  - radius_inner) / (radius_outer - radius_inner), 0.0, 1.0)
+            mask_combined = np.maximum(mask_start, mask_goal)
+
+            # Cosine easing
+            mask_smooth = 0.5 - 0.5 * np.cos(np.pi * np.clip(mask_combined, 0.0, 1.0))
+
+            # Blend: core stays at flat_h, outer keeps the generated terrain
+            z = (1.0 - mask_smooth) * self.flat_h + mask_smooth * z
+
+            z[0:self.flat_size, 0:self.flat_size] = self.flat_h
+            z[-self.flat_size:, -self.flat_size:] = self.flat_h
 
             # Path finding
             path = astar_path(z, start, goal, max_step=max_step)
@@ -355,10 +388,6 @@ class RobotEnv(gym.Env):
             berm   = 0.03 + 0.08*diff
             z, band = carve_corridor(z, path, corridor_w, smooth_sigma, drop, keep_rough, berm)
             z = clamp_slope_iter(z, max_dz_per_cell=clamp_limit, passes=2)
-
-            # Final guarantee of flatness in start/goal zones
-            z[0:platform, 0:platform] = self.flat_h
-            z[-platform:, -platform:] = self.flat_h
 
             self.heightmap = z.astype(np.float32)
             self.path_cells = path
@@ -440,7 +469,6 @@ class RobotEnv(gym.Env):
             self._debug_draw_path(self.path_cells, life=0)
             return self.terrain_id
 
-        # fallback flat world
         self.heightmap = np.full((size, size), self.flat_h, dtype=np.float32)
         self.path_cells = None
         shape = p.createCollisionShape(p.GEOM_HEIGHTFIELD,
@@ -472,14 +500,15 @@ class RobotEnv(gym.Env):
                                           float(self.goal_xy[1]),
                                           self.flat_h + 0.15])
 
-    # ----------------------------------------------------------------------
-    # Environment reset & step
-    # ----------------------------------------------------------------------
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
         p.resetSimulation()
         p.setGravity(0, 0, -9.81)
+
+        # Configure stable high-frequency physics simulation
+        # for wheeled robot dynamics.
         p.setPhysicsEngineParameter(
             fixedTimeStep=1.0 / 240.0,
             numSolverIterations=80,
@@ -504,7 +533,7 @@ class RobotEnv(gym.Env):
         true_ground_z = self.flat_h
         if res and res[0][0] != -1:
             true_ground_z = res[0][3][2]
-        spawn_z = true_ground_z + 1.0   # 1 m above terrain to drop safely
+        spawn_z = true_ground_z + 0.65
 
         yaw = float(np.arctan2(self.goal_xy[1] - self.start_xy[1],
                                self.goal_xy[0] - self.start_xy[0]))
@@ -515,8 +544,26 @@ class RobotEnv(gym.Env):
             flags=p.URDF_USE_INERTIA_FROM_FILE,
         )
 
-        # Configure dynamics – softer, more stable
-        p.changeDynamics(self.robot, -1, collisionMargin=0.03, mass=55.0, lateralFriction=2.5)
+        # Detect wheel joints after robot is loaded
+        self.wheel_joints = []
+
+        num_joints = p.getNumJoints(self.robot)
+        for j in range(num_joints):
+            joint_name = p.getJointInfo(self.robot, j)[1].decode("utf-8").lower()
+
+            if "wheel" in joint_name:
+                self.wheel_joints.append(j)
+
+        if len(self.wheel_joints) != 4:
+            raise RuntimeError(f"Expected 4 wheel joints, got {len(self.wheel_joints)}: {self.wheel_joints}")
+
+        p.resetBaseVelocity(
+            self.robot,
+            linearVelocity=[0, 0, 0],
+            angularVelocity=[0, 0, 0]
+        )
+
+        p.changeDynamics(self.robot, -1, mass=55.0, lateralFriction=2.5)
         num_joints = p.getNumJoints(self.robot)
         non_physical = ['base_footprint', 'imu_link', 'top_plate_link',
                         'user_rail_link', 'front_bumper_link', 'rear_bumper_link']
@@ -527,13 +574,16 @@ class RobotEnv(gym.Env):
             else:
                 p.changeDynamics(self.robot, j, lateralFriction=2.5, rollingFriction=0.05)
         for wheel in self.wheel_joints:
-            p.changeDynamics(self.robot, wheel,
-                             lateralFriction=1.8,
-                             rollingFriction=0.03,
-                             spinningFriction=0.01,
-                             contactStiffness=2000.0,    # reduced to avoid bouncing
-                             contactDamping=80.0,
-                             contactProcessingThreshold=0)
+            p.changeDynamics(
+                self.robot,
+                wheel,
+                lateralFriction=2.2,
+                rollingFriction=0.02,
+                spinningFriction=0.005,
+                contactStiffness=30000.0,
+                contactDamping=1200.0,
+                contactProcessingThreshold=0
+            )
 
         # Drop the robot and let it settle
         for _ in range(150):
@@ -552,6 +602,9 @@ class RobotEnv(gym.Env):
 
         return self._get_obs(), {}
 
+    # Construct observation vector combining:
+    # navigation state, robot dynamics, terrain perception,
+    # and curriculum difficulty.
     def _get_obs(self):
         pos, orn = p.getBasePositionAndOrientation(self.robot)
         vel, ang = p.getBaseVelocity(self.robot)
@@ -571,12 +624,12 @@ class RobotEnv(gym.Env):
         raw_obs = [
             to_goal[0]*0.1, to_goal[1]*0.1, dist*0.1,
             angle_diff, np.sin(yaw), np.cos(yaw),
-            vel[0]*0.1, vel[1]*0.1, ang[2]*0.5,       # angular velocity upweighted
+            vel[0]*0.1, vel[1]*0.1, ang[2]*0.5,      
             pos[2]*0.5,
             roll*0.5, pitch*0.5, self.steps/1000.0, 1.0
         ]
 
-        # Ray heights (relative to robot base)
+        # Ray heights
         starts, ends = [], []
         for dx, dy in self.sample_offsets:
             wx = pos[0] + dx*np.cos(yaw) - dy*np.sin(yaw)
@@ -610,7 +663,7 @@ class RobotEnv(gym.Env):
         return np.sqrt(min_dist)
 
     def step(self, action):
-        # ---- Unpack action and compute wheel speeds ----
+        # Unpack action and compute wheel speeds
         target_lin_vel = np.clip(action[0], -1.0, 1.0) * self.max_linear_vel
         self.current_linear_vel = (1.0 - self.alpha_smooth) * self.current_linear_vel + \
                                   self.alpha_smooth * target_lin_vel
@@ -636,7 +689,6 @@ class RobotEnv(gym.Env):
 
         self.steps += 1
 
-        # ---- Get state ----
         pos, orn = p.getBasePositionAndOrientation(self.robot)
         roll, pitch, yaw = p.getEulerFromQuaternion(orn)
         vel, ang_vel = p.getBaseVelocity(self.robot)
@@ -645,10 +697,11 @@ class RobotEnv(gym.Env):
         progress = self.prev_dist - dist
         self.prev_dist = dist
 
-        # ---- Core reward ----
-        reward = progress * 2.0   # main driving reward
+        # Core reward
+        reward = progress * 2.0   # Reward forward progress toward the navigation goal.
 
         # Heading alignment
+        # Encourage robot orientation toward the target.
         to_goal = self.goal_xy - np.array(pos[:2])
         angle_to_goal = np.arctan2(to_goal[1], to_goal[0])
         angle_diff = np.arctan2(np.sin(angle_to_goal - yaw),
@@ -656,25 +709,31 @@ class RobotEnv(gym.Env):
         reward += 1.0 * np.cos(angle_diff)
 
         # Path deviation penalty (only when path exists)
+        # Penalize deviation from traversable corridor.
         if self.path_cells is not None:
             reward -= 0.005 * self._distance_to_path(pos)
 
         # Tilt penalty – encourage staying upright
+        # Penalize excessive roll and pitch angles
+        # to encourage stable locomotion.
         tilt_angle = np.sqrt(roll**2 + pitch**2)
         reward -= 0.5 * tilt_angle   # gentle penalty
 
         # Smoothness / torque penalty (prevent wheel spin)
+        # Penalize excessive motor torque usage
+        # to reduce wheel spinning and unstable behavior.
         motor_torques = [state[3] for state in p.getJointStates(self.robot, self.wheel_joints)]
         torque_penalty = np.mean(np.abs(motor_torques)) / self.max_motor_force
         reward -= 0.01 * torque_penalty
 
         # Vertical velocity penalty (bouncing)
+        # Discourage bouncing and aggressive vertical motion.
         reward -= 0.1 * abs(vel[2])
 
-        # Small time penalty to encourage efficiency
+        # Small survival penalty encouraging faster goal reaching.
         reward -= 0.02
 
-        # ---- Termination logic (softened) ----
+        #Termination logic
         terminated = False
         truncated = False
 
@@ -685,6 +744,7 @@ class RobotEnv(gym.Env):
             return self._get_obs(), float(reward), terminated, truncated, {"reach_goal": True}
 
         # Flip / excessive tilt – give grace period
+        # Allow temporary instability without immediate termination.
         if abs(roll) > 1.2 or abs(pitch) > 1.2:
             reward -= 5.0                # immediate penalty
             self.flip_timer += 1
@@ -713,9 +773,6 @@ class RobotEnv(gym.Env):
 
         return self._get_obs(), float(reward), terminated, truncated, {"reach_goal": False}
 
-    # ----------------------------------------------------------------------
-    # Debug drawing & cleanup
-    # ----------------------------------------------------------------------
     def _clear_debug(self):
         if not self.render: return
         for did in self._debug_ids:
@@ -723,6 +780,7 @@ class RobotEnv(gym.Env):
             except: pass
         self._debug_ids = []
 
+    # Visualize generated navigation corridor in PyBullet GUI.
     def _debug_draw_path(self, path_cells, life=0):
         if not self.render or not self.draw_path or path_cells is None or len(path_cells)<2:
             return
