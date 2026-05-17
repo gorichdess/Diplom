@@ -31,8 +31,12 @@ The environment supports:
 ## Project structure
 
 ```text
+├──evaluation_results         # Folder with results of training
+  ├──base_model               # Folder with base model results
+  ├──curr_model               # Folder with curriclum model results
+  ├──no_curr_0.5              # Folder with of stable difficulty = 0.5 model results
+  ├──no_curr_1                # Folder with of stable difficulty = 1 model results
 ├── upds                      # Folder with checkpoints of training sorted by PPO updates + log file
-  ├──base_model               # Folder with checkpoints of base model training
   ├──upds_curr_0-1            # Folder with checkpoints of curriculum training
   ├──upds_no_curr_0.5         # Folder with checkpoints of stable difficulty = 0.5 training
   ├──upds_no_curr_1           # Folder with checkpoints of stable difficulty = 1.0 training
