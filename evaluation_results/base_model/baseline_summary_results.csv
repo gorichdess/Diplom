@@ -1,0 +1,7 @@
+method,difficulty,episodes,successful_episodes,success_rate_percent,avg_reward,std_reward,min_reward,max_reward,avg_steps,std_steps
+Proportional controller,0.0,100,100,100.0,10584.23,0.0,10584.23,10584.23,499.0,0.0
+Proportional controller,0.5,100,39,39.0,4391.23,5001.47,200.68,10561.96,493.65,94.72
+Proportional controller,1.0,100,14,14.0,1788.03,3537.18,25.73,10575.18,483.79,129.37
+Random policy,0.0,100,0,0.0,1722.67,118.01,1398.86,1911.46,2000.0,0.0
+Random policy,0.5,100,0,0.0,1651.32,135.3,1257.81,1860.74,2000.0,0.0
+Random policy,1.0,100,0,0.0,1594.32,165.98,1047.51,1814.4,2000.0,0.0

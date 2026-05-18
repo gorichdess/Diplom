@@ -1,0 +1,4 @@
+method,difficulty,episodes,successful_episodes,success_rate_percent,avg_reward,std_reward,min_reward,max_reward,avg_steps,std_steps
+PPO agent,0.0,100,100,100.0,10587.09,0.0,10587.09,10587.09,505.0,0.0
+PPO agent,0.5,100,54,54.0,5890.31,5072.39,198.97,10599.69,499.44,102.32
+PPO agent,1.0,100,23,23.0,2978.22,4483.49,-47.16,10612.63,484.72,142.32
