@@ -60,6 +60,8 @@ Both actions are normalized to the range [-1, 1].
 
 The observation vector contains robot navigation features, dynamic state information, terrain ray samples, and the current terrain difficulty. The terrain difficulty ranges from 0.0 for flat terrain to 1.0 for highly irregular terrain.
 
+<img width="999" height="333" alt="image" src="https://github.com/user-attachments/assets/ee6a3297-5832-4098-a6da-5b621152190e" />
+
 ## PPO agent
 
 The PPO agent uses an Actor-Critic neural network.
@@ -169,5 +171,7 @@ avg_steps
 std_steps
 
 These metrics are used to compare the trained reinforcement learning policy with non-learning baseline controllers.
+
+https://github.com/user-attachments/assets/14d87584-8ce8-4ae3-a348-5e34aa8b79d8
 
 ## Author:Kateryna Lisna
